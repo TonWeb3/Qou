@@ -1,0 +1,38 @@
+{
+  "quotex": {
+    "email": "hhhh@gmail.com",
+    "password": "hhh",
+    "early_entry_seconds": 1
+  },
+  "telegram": {
+    "api_id": 00000000,
+    "api_hash": "000000000000000",
+    "session_name": "bot_session",
+    "channels": [
+      {
+        "enabled": true,
+        "identifier": "Back to it"
+      },
+      {
+        "enabled": false,
+        "identifier": ""
+      }
+    ]
+  },
+  "trading": {
+    "account_type": "demo",
+    "risk_mode": "percent",
+    "risk_amount": 10,
+    "max_daily_trades": 100,
+    "max_daily_loss": 50,
+    "max_daily_loss_enabled": true,
+    "max_concurrent_trades": 8,
+    "martingale_enabled": true,
+    "martingale_multiplier": 2,
+    "martingale_steps": 2
+  },
+  "logging": {
+    "log_level": "INFO",
+    "log_file": "quotex_bot.log"
+  }
+}

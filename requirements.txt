@@ -1,0 +1,21 @@
+# ── Quotex API (installed from GitHub — the PyPI name is different) ──
+git+https://github.com/cleitonleonel/pyquotex.git
+
+# ── Quotex API dependencies ───────────────────────────────────────────
+websockets
+aiohttp
+cloudscraper
+requests
+
+# ── Telegram ──────────────────────────────────────────────────────────
+telethon
+cryptg
+
+# ── Web dashboard ─────────────────────────────────────────────────────
+flask
+flask-socketio
+simple-websocket
+
+# ── Utilities ─────────────────────────────────────────────────────────
+certifi
+pytz
