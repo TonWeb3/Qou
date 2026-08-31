@@ -167,7 +167,7 @@ class TradingBot:
                             self.logger.error("Health monitor: Quotex connect failed")
                 else:
                     self.logger.info("Health monitor: checking Quotex...")
-                    if not self.quotex_handler._connection_alive():
+                    if not await self.quotex_handler._connection_alive():
                         self.logger.warning("Health monitor: Quotex disconnected — reconnecting...")
                         self.alert = "Quotex disconnected — reconnecting..."
                         if await self.quotex_handler.connect():
@@ -187,8 +187,9 @@ class TradingBot:
     async def _balance_monitor(self):
         """
         Refresh the balance every 10 s so the dashboard shows live figures even
-        when no trades are running. pyquotex serves get_balance() from a cache the
-        WebSocket keeps updated, so this costs nothing on the wire.
+        when no trades are running. Reads authoritatively (HTTP), because the
+        WebSocket-cached balance can stay frozen at its login value for an entire
+        session — which would also freeze daily P&L and the daily-loss limit.
         """
         while self.running:
             await asyncio.sleep(10)
@@ -196,7 +197,7 @@ class TradingBot:
                 break
             try:
                 if self.quotex_handler.is_connected:
-                    await self.quotex_handler._refresh_balance_stats()
+                    await self.quotex_handler._refresh_balance_stats(authoritative=True)
             except Exception as e:
                 self.logger.debug(f"Balance monitor: {e}")
 

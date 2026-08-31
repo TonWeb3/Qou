@@ -290,11 +290,18 @@
               <label class="form-label">Entry Lead (sec)</label>
               <input class="form-input" id="s-early-entry" type="number" min="0" max="5" step="0.1" placeholder="0.5">
             </div>
+            <div class="form-group">
+              <label class="form-label">Late Entry Grace (sec)</label>
+              <input class="form-input" id="s-late-grace" type="number" min="0" max="60" step="0.5" placeholder="5">
+            </div>
           </div>
           <div class="modal-info" style="margin-top:12px;">
             <b>Entry Lead</b> compensates for order latency only — trades run for a fixed
             duration from the fill, so the order should land <i>on</i> the entry second.
             Match it to the "fill latency" figure in the Activity Log (typically 0.3&ndash;1.0s).
+            <br><br>
+            <b>Late Entry Grace</b> — if the order cannot be sent within this many seconds
+            of that moment, the signal is dropped rather than entered late.
             <br><br>
             Credentials are saved here and used by the bot automatically. On Railway, you can override with
             <code>QUOTEX_EMAIL</code> and <code>QUOTEX_PASSWORD</code> environment variables.

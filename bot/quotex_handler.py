@@ -22,6 +22,16 @@ try:
 except ImportError:
     Quotex = None
 
+# How long to wait for Quotex to acknowledge an order. pyquotex itself waits
+# duration+5s, but a 1-minute signal is worthless by then, so we cap it. NOTE:
+# the order is transmitted before this wait — a timeout means "unconfirmed",
+# not "not sent".
+BUY_CONFIRM_TIMEOUT = 20
+
+# Where the day's opening balance and counters are persisted, so the daily
+# limits survive a restart instead of silently starting over.
+DAILY_STATE_FILE = "daily_state.json"
+
 
 class QuotexHandler:
     def __init__(self, config: Config):
@@ -30,6 +40,9 @@ class QuotexHandler:
         self.client: Optional[Any] = None
         self.is_connected = False
         self.last_place_latency: Optional[float] = None  # measured seconds from buy() call to confirmation
+        # Only ONE order may be in flight through pyquotex at a time — see the
+        # comment in _place_one(). Settlement (check_win) stays concurrent.
+        self._buy_lock = asyncio.Lock()
         self.balance: Optional[float] = None              # last known account balance (dashboard)
         self.last_trade: Optional[dict] = None            # last placed trade + its result (dashboard)
         self.daily_trades = 0
@@ -40,6 +53,9 @@ class QuotexHandler:
         self.active_trades = 0
         self._trade_date = None
         self._day_start_balance: Optional[float] = None   # balance snapshot at 00:00
+        # The day's counters are persisted, so restarting the bot mid-day does
+        # NOT hand you a fresh set of limits. Loaded per account type.
+        self._load_daily_state()
 
     # ─────────────────────────────────────────────────────────
     #  CONNECTION
@@ -153,9 +169,32 @@ class QuotexHandler:
         password = os.getenv("QUOTEX_PASSWORD") or self.config.quotex.password
         return bool(email and password)
 
-    def _connection_alive(self) -> bool:
-        """Return True if the connection is marked as live."""
-        return self.is_connected and self.client is not None
+    async def _connection_alive(self) -> bool:
+        """
+        True only while the WebSocket is still AUTHENTICATED with Quotex.
+
+        The previous check was `self.is_connected and self.client is not None`
+        — a flag WE set at login, so it could never become false on its own. A
+        session the broker dropped or kicked (signing in from a browser or
+        another device de-authorises the socket) stayed "alive" forever, the
+        health monitor never reconnected, and orders went into a socket the
+        server ignores: no confirmation, no error, just a timeout.
+        """
+        if not (self.is_connected and self.client is not None):
+            return False
+        try:
+            alive = await asyncio.wait_for(self.client.check_connect(), timeout=10)
+        except Exception as e:
+            self.logger.warning(f"Quotex connection check failed: {e}")
+            alive = False
+        if not alive:
+            self.is_connected = False      # let the health monitor reconnect
+        return alive
+
+    def _time_mode(self) -> str:
+        """Order style: TIMER = fixed duration (optionType 100), TURBO = candle-aligned."""
+        mode = str(getattr(self.config.quotex, "time_mode", "TIMER") or "TIMER").upper()
+        return mode if mode in ("TIMER", "TURBO", "TIME") else "TIMER"
 
     async def disconnect(self):
         if self.client:
@@ -186,17 +225,119 @@ class QuotexHandler:
 
     async def _is_asset_open(self, asset_name: str) -> bool:
         """
-        Return True if the asset is tradable right now (market open).
+        Return True only if Quotex currently lists this asset as tradable.
         check_asset_open() returns (raw, (id, name, is_open)); is_open is the flag.
-        On a check failure, return True so a transient error doesn't block a real
-        trade — the buy() timeout in perform_trade() is the backstop for hangs.
+
+        Fails CLOSED. The previous version returned True when the check itself
+        errored, on the theory that buy()'s timeout was a backstop — but that
+        "backstop" costs 20 s AND sends a real order into the void, because
+        buy() transmits orders/open before it waits for the confirmation. If we
+        cannot confirm the asset is tradable, we do not trade it.
         """
         try:
-            _, status_info = await self.client.check_asset_open(asset_name)
-            return bool(status_info and status_info[2])
+            _, status_info = await asyncio.wait_for(
+                self.client.check_asset_open(asset_name), timeout=15
+            )
         except Exception as e:
-            self.logger.warning(f"Could not verify if {asset_name} is open: {e}")
+            self.logger.error(
+                f"Could not verify whether {asset_name} is tradable ({e}) — "
+                f"not trading it."
+            )
+            return False
+
+        if status_info and status_info[2]:
             return True
+
+        # Not tradable — say WHY, so the log answers the question next time.
+        try:
+            names = [str(i[1]) for i in (self.client.api.instruments or [])]
+        except Exception:
+            names = []
+
+        if not names:
+            self.logger.error(
+                f"Quotex returned no instrument list — the WebSocket is not "
+                f"authenticated, so {asset_name} cannot be verified."
+            )
+        elif asset_name not in names:
+            base = asset_name.replace("_otc", "")[:3].upper()
+            near = [n for n in names if n.upper().startswith(base)][:8]
+            self.logger.error(
+                f"{asset_name} is NOT offered by Quotex on this account "
+                f"({len(names)} instruments listed). Closest names: {near or 'none'}"
+            )
+        else:
+            self.logger.warning(f"{asset_name} is listed but CLOSED right now.")
+        return False
+
+    def _late_grace(self) -> float:
+        """Seconds past the intended entry moment that an order may still go out."""
+        try:
+            return max(0.0, float(self.config.quotex.late_entry_grace_seconds))
+        except Exception:
+            return 5.0
+
+    def _too_late_to_enter(self, not_after: Optional[float],
+                           asset_name: str, direction: str) -> bool:
+        """
+        True when the entry moment has passed by more than the grace period, so
+        the order must NOT be sent.
+
+        A signal is only worth trading at its stated entry. Anything that eats
+        the intervening seconds — a slow asset check, queueing behind another
+        order's confirmation, a stalled machine — makes the trade a different
+        bet from the one the signal described, so it is dropped rather than
+        entered late.
+        """
+        if not_after is None:
+            return False
+        overdue = time.time() - not_after
+        if overdue <= 0:
+            return False
+        self.logger.warning(
+            f"TOO LATE — skipping {asset_name} {direction.upper()}: the entry moment "
+            f"passed {overdue + self._late_grace():.1f}s ago, beyond the "
+            f"{self._late_grace():.1f}s grace. No order sent."
+        )
+        return True
+
+    def _clear_pending_order_state(self):
+        """
+        Forget a half-finished order. pyquotex keeps only one pending-order id,
+        so a confirmation arriving late (after we gave up) would otherwise be
+        adopted by the NEXT trade as if it were its own.
+        """
+        try:
+            self.client.api.buy_id = None
+            self.client.api.slots.buy_confirm.clear()
+        except Exception as e:
+            self.logger.debug(f"Could not clear pending order state: {e}")
+
+    async def _diagnose_no_confirmation(self, asset_name: str) -> str:
+        """
+        Explain a missing order confirmation.
+
+        Note buy() sends orders/open BEFORE waiting, so a timeout does not prove
+        the order was rejected — it may be live at the broker but untracked here.
+        """
+        bits = []
+        try:
+            authed = await asyncio.wait_for(self.client.check_connect(), timeout=5)
+        except Exception:
+            authed = False
+        bits.append(f"ws_authenticated={authed}")
+        if not authed:
+            self.is_connected = False        # health monitor will reconnect
+            bits.append("session is dead — flagged for reconnect")
+        try:
+            state = self.client.api.state
+            if getattr(state, "check_websocket_if_error", False):
+                bits.append(f"ws_error={getattr(state, 'websocket_error_reason', '')!r}")
+        except Exception:
+            pass
+        bits.append(f"time_mode={self._time_mode()}")
+        bits.append("the order MAY still have reached Quotex — check the platform")
+        return " | ".join(bits)
 
     # ─────────────────────────────────────────────────────────
     #  PRE-CONFIGURE  (timed signals)
@@ -274,9 +415,81 @@ class QuotexHandler:
         except Exception:
             return 60
 
+    # ─────────────────────────────────────────────────────────
+    #  DAILY STATE  (persisted — survives restarts)
+    # ─────────────────────────────────────────────────────────
+
+    def _daily_state_path(self):
+        from pathlib import Path
+        return Path(__file__).parent.parent / DAILY_STATE_FILE
+
+    def _account_key(self) -> str:
+        """Demo and live have separate balances, so they get separate day state."""
+        return "live" if self.config.trading.account_type.lower() == "live" else "demo"
+
+    def _load_daily_state(self):
+        """
+        Restore today's opening balance and counters from disk.
+
+        Without this, restarting the bot at any point re-snapshotted the opening
+        balance from the CURRENT balance and zeroed the trade count — so a
+        max_daily_loss you had already hit was forgiven, and max_daily_trades
+        started over. Anything saved under an older date is ignored (new day).
+        """
+        import json as _json
+        try:
+            path = self._daily_state_path()
+            if not path.exists():
+                return
+            saved = _json.loads(path.read_text(encoding="utf-8")).get(self._account_key())
+            if not saved:
+                return
+            if saved.get("date") != datetime.now().date().isoformat():
+                return                        # stale — a new day starts clean
+            self._trade_date        = datetime.now().date()
+            self._day_start_balance = saved.get("open_balance")
+            self.daily_trades       = int(saved.get("trades", 0))
+            self.wins               = int(saved.get("wins", 0))
+            self.losses             = int(saved.get("losses", 0))
+            self.logger.info(
+                f"Resumed today's {self._account_key()} state: open balance "
+                f"${self._day_start_balance}, {self.daily_trades} trades, "
+                f"{self.wins}W/{self.losses}L"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not load daily state: {e}")
+
+    def _save_daily_state(self):
+        """Persist today's opening balance + counters (other accounts preserved)."""
+        import json as _json
+        try:
+            path = self._daily_state_path()
+            data = {}
+            if path.exists():
+                try:
+                    data = _json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data[self._account_key()] = {
+                "date":         (self._trade_date or datetime.now().date()).isoformat(),
+                "open_balance": self._day_start_balance,
+                "trades":       self.daily_trades,
+                "wins":         self.wins,
+                "losses":       self.losses,
+                "saved_at":     datetime.now().isoformat(timespec="seconds"),
+            }
+            path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.logger.warning(f"Could not save daily state: {e}")
+
     def _reset_daily_counters_if_new_day(self):
         today = datetime.now().date()
         if self._trade_date != today:
+            if self._trade_date is not None:
+                self.logger.info(
+                    f"New trading day ({today}) — resetting counters; the opening "
+                    f"balance is re-snapshotted on the next balance read."
+                )
             self.daily_trades       = 0
             self.daily_loss         = 0.0
             self.wins               = 0
@@ -284,8 +497,40 @@ class QuotexHandler:
             self.daily_pnl          = 0.0
             self._day_start_balance = None   # re-snapshot opening balance on the new day
             self._trade_date        = today
+            self._save_daily_state()
 
-    async def _refresh_balance_stats(self):
+    async def _read_balance(self, authoritative: bool = False) -> Optional[float]:
+        """
+        Current account balance.
+
+        pyquotex's get_balance() returns a CACHED figure (api.account_balance,
+        only refreshed when the server pushes a balance message) plus the profit
+        of the open trade. Measured: it can stay frozen at the login value for a
+        whole session even after ten settled trades — which would leave
+        daily_pnl at 0.00 and stop max_daily_loss from ever firing.
+
+        authoritative=True re-reads it over HTTP (/api/v1/cabinets/digest via
+        get_profile), which always reflects settled trades. Use it off the
+        critical path — after settlement and from the idle monitor — and keep
+        the cached read for the pre-trade gate, where latency matters.
+        """
+        if authoritative:
+            try:
+                profile = await self.client.get_profile()
+                if profile is not None:
+                    live = self.config.trading.account_type.lower() == "live"
+                    value = profile.live_balance if live else profile.demo_balance
+                    if value is not None:
+                        return float(value)
+            except Exception as e:
+                self.logger.debug(f"Authoritative balance read failed: {e}")
+        try:
+            return await self.client.get_balance()
+        except Exception as e:
+            self.logger.warning(f"Could not read balance: {e}")
+            return None
+
+    async def _refresh_balance_stats(self, authoritative: bool = False):
         """
         Snapshot the day's opening balance at 00:00, then derive realized daily
         P&L and drawdown from the live account balance:
@@ -294,17 +539,19 @@ class QuotexHandler:
         Both are sourced from the balance so they reflect actual money, not stakes.
         """
         self._reset_daily_counters_if_new_day()
-        try:
-            balance = await self.client.get_balance()
-        except Exception as e:
-            self.logger.warning(f"Could not read balance for daily P&L/loss: {e}")
-            return
+        balance = await self._read_balance(authoritative=authoritative)
         if balance is None:
             return
         self.balance = balance
         if self._day_start_balance is None:
+            # First reading of the day — this is the figure every daily limit is
+            # measured against, so it is written to disk immediately.
             self._day_start_balance = balance
-            self.logger.info(f"Opening balance for {self._trade_date}: ${balance:.2f}")
+            self._save_daily_state()
+            self.logger.info(
+                f"Opening balance for {self._trade_date}: ${balance:.2f} "
+                f"({self._account_key()}) — saved as today's baseline."
+            )
 
         # In percent risk mode, express P&L / loss as a % of the opening balance
         # so the max_daily_loss limit is also read as a percentage. Otherwise dollars.
@@ -348,6 +595,7 @@ class QuotexHandler:
             self.wins += 1
         elif won is False:
             self.losses += 1
+        self._save_daily_state()
         if self.last_trade is not None:
             self.last_trade["result"] = "win" if won is True else "loss" if won is False else "unknown"
             self.last_trade["profit"] = round(profit, 2)
@@ -359,7 +607,7 @@ class QuotexHandler:
         """Background settle: wait for the trade to close, record win/loss + P&L."""
         won, profit = await self._get_trade_result(order_id, duration_secs)
         self._record_result(won, profit)
-        await self._refresh_balance_stats()
+        await self._refresh_balance_stats(authoritative=True)
 
     async def _place_one(
         self,
@@ -369,49 +617,72 @@ class QuotexHandler:
         amount: float,
         expiry: Optional[str],
         wait_result: bool,
+        not_after: Optional[float] = None,
     ):
         """
         Place a single trade and optionally wait for its result.
         Returns (placed, won):
-          placed = False        → the order never went on (timeout / rejected)
+          placed = False        → the order never went on (timeout / rejected / too late)
           won    = True/False/None when wait_result is True; always None otherwise
+
+        not_after: wall-clock epoch after which this entry is stale and must NOT
+        be sent (see _too_late_to_enter).
         """
         self.logger.info(
             f"Placing trade: {asset_name} {direction.upper()} "
             f"${amount:.2f}  duration: {period_secs}s  (runs {period_secs}s from entry)"
         )
 
-        # Signals come from Telegram, not from price data, so the realtime price
-        # stream is NOT needed to decide a trade. buy() would otherwise block in
-        # start_realtime_price() waiting for live ticks and time out valid trades.
-        # Seed one price entry so that check passes instantly and the order is sent
-        # immediately on the already-selected pair. (buy() ignores the value — the
-        # broker fills at its own market price; this only skips the pointless wait.)
-        try:
-            self.client.api.realtime_price.setdefault(asset_name, []).append(
-                {"time": 0, "price": 0}
-            )
-        except Exception as _e:
-            self.logger.debug(f"Could not seed price stream: {_e}")
+        # ── Orders MUST be sent one at a time ─────────────────────────────
+        # pyquotex tracks the pending order in a SINGLE shared field
+        # (api.buy_id) with ONE shared confirmation slot (api.slots.buy_confirm),
+        # and buy() clears both as it starts (api.py:505-522). Two overlapping
+        # buy() calls therefore steal each other's confirmation: ids get
+        # duplicated across trades, results are attributed to the wrong order,
+        # and later orders sit unconfirmed until they time out. Serialise the
+        # send+confirm window. check_win() afterwards is keyed per order id and
+        # stays fully concurrent, so this only costs the round trip.
+        async with self._buy_lock:
+            # Waiting for that lock is itself a way to become late, so the
+            # freshness check happens HERE — the last moment before the order
+            # goes out — not before the queue.
+            if self._too_late_to_enter(not_after, asset_name, direction):
+                return False, None
 
-        # time_mode="TIMER": duration option (optionType 100, expiry sent as a
-        # RELATIVE number of seconds). The trade runs for exactly `period_secs`
-        # from the moment the broker accepts it — it is NOT snapped to the next
-        # candle boundary, so a 1-minute signal is always a full 1 minute and a
-        # late placement can never land on the wrong candle. Bounded timeout so a
-        # stuck buy() can't hold the concurrency slot forever.
-        fired_at = time.monotonic()
-        try:
-            status, buy_info = await asyncio.wait_for(
-                self.client.buy(amount, asset_name, direction, period_secs, time_mode="TIMER"),
-                timeout=20,
-            )
-        except asyncio.TimeoutError:
-            self.logger.error(
-                f"Trade NOT placed for {asset_name} — no order confirmation from "
-                f"Quotex within 20s."
-            )
-            return False, None
+            # Signals come from Telegram, not from price data, so the realtime
+            # price stream is NOT needed to decide a trade. buy() would otherwise
+            # block in start_realtime_price() waiting for live ticks and time out
+            # valid trades. Seed one price entry so that check passes instantly.
+            # (buy() ignores the value — the broker fills at its own price.)
+            try:
+                self.client.api.realtime_price.setdefault(asset_name, []).append(
+                    {"time": 0, "price": 0}
+                )
+            except Exception as _e:
+                self.logger.debug(f"Could not seed price stream: {_e}")
+
+            # time_mode="TIMER": duration option (optionType 100, expiry sent as
+            # a RELATIVE number of seconds). The trade runs for exactly
+            # `period_secs` from the moment the broker accepts it — it is NOT
+            # snapped to the next candle boundary, so a 1-minute signal is always
+            # a full minute and a late placement can never land on the wrong
+            # candle. Bounded timeout so a stuck buy() can't hold the lock.
+            fired_at = time.monotonic()
+            try:
+                status, buy_info = await asyncio.wait_for(
+                    self.client.buy(amount, asset_name, direction, period_secs,
+                                    time_mode=self._time_mode()),
+                    timeout=BUY_CONFIRM_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # Drop the half-finished order's state before releasing the lock,
+                # so the NEXT order cannot inherit this one's id.
+                self._clear_pending_order_state()
+                self.logger.error(
+                    f"No order confirmation for {asset_name} within {BUY_CONFIRM_TIMEOUT}s. "
+                    f"{await self._diagnose_no_confirmation(asset_name)}"
+                )
+                return False, None
 
         if not status:
             self.logger.error(f"Trade rejected by Quotex — NOT placed: {buy_info}")
@@ -419,6 +690,7 @@ class QuotexHandler:
 
         self.last_place_latency = time.monotonic() - fired_at
         self.daily_trades += 1
+        self._save_daily_state()      # the trade count must survive a restart
         order_id = buy_info.get("id") if isinstance(buy_info, dict) else None
         self.last_trade = {
             "asset":     asset_name,
@@ -451,7 +723,7 @@ class QuotexHandler:
         if wait_result:
             won, profit = await self._get_trade_result(order_id, result_timeout)
             self._record_result(won, profit)
-            await self._refresh_balance_stats()
+            await self._refresh_balance_stats(authoritative=True)
             return True, won
         # Non-martingale: record in the background so the next signal isn't delayed.
         asyncio.ensure_future(self._settle_and_record(order_id, result_timeout))
@@ -467,9 +739,19 @@ class QuotexHandler:
         direction: str,
         expiry: Optional[str] = None,
         pre_configured_amount: Optional[float] = None,
+        not_after: Optional[float] = None,
     ) -> bool:
+        """
+        not_after: wall-clock epoch after which this entry is stale. Applies to
+        the FIRST order only — a martingale recovery deliberately happens a
+        minute later and must not be judged against the original entry time.
+        """
         if not self.is_connected or not self.client:
             self.logger.error("QuotexHandler not connected.")
+            return False
+
+        # Cheap early exit before the gates spend time on balance/asset checks.
+        if self._too_late_to_enter(not_after, self._format_asset(symbol), direction):
             return False
 
         # Refresh realized daily P&L / drawdown from the live balance before gating.
@@ -524,7 +806,7 @@ class QuotexHandler:
             if not self.config.trading.martingale_enabled:
                 placed, _ = await self._place_one(
                     asset_name, direction, period_secs, base_amount, expiry,
-                    wait_result=False,
+                    wait_result=False, not_after=not_after,
                 )
                 return placed
 
@@ -543,6 +825,9 @@ class QuotexHandler:
                 placed, won = await self._place_one(
                     asset_name, direction, period_secs, amount, expiry,
                     wait_result=True,
+                    # Only the first order answers to the signal's entry time; a
+                    # recovery is meant to be a candle later.
+                    not_after=not_after if step == 1 else None,
                 )
                 if not placed:
                     # Couldn't place — nothing to carry, the sequence just ends.

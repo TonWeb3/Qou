@@ -32,6 +32,7 @@ import logging
 import re
 import os
 import json
+import time
 import unicodedata
 from datetime import datetime
 import pytz
@@ -167,6 +168,7 @@ class SignalExecutor:
             # The timezone MUST come from the signal — there is no UTC fallback,
             # so a trade is never fired at the wrong moment on an assumed zone.
             wait_secs = None
+            not_after = None      # set below for timed signals; None = no deadline
             if signal.get('entry_time'):
                 wait_secs = self._calc_wait(signal['entry_time'], signal.get('timezone'))
                 if wait_secs is None:
@@ -214,10 +216,30 @@ class SignalExecutor:
                     if delay <= 0.0:
                         break
                     await asyncio.sleep(delay if delay < 1.0 else min(delay - 0.5, 30.0))
-                late = -(self._calc_wait(signal['entry_time'], signal.get('timezone')) or 0.0)
+                # Deadline for actually sending the order: the intended firing
+                # moment (entry − lead) plus the configured grace. Anything that
+                # eats those seconds — a slow asset check, queueing behind
+                # another order, a stalled machine — means the signal's moment
+                # has gone and the trade is dropped rather than entered late.
+                remaining = self._calc_wait(signal['entry_time'], signal.get('timezone')) or 0.0
+                grace = max(0.0, float(
+                    getattr(self.config.quotex, 'late_entry_grace_seconds', 5.0)
+                ))
+                fire_at   = time.time() + remaining - early
+                not_after = fire_at + grace
+                late      = -remaining
+
+                if time.time() > not_after:
+                    self.logger.warning(
+                        f"Skipping {asset} {direction.upper()} — entry {signal['entry_time']} "
+                        f"was missed by {time.time() - fire_at:.1f}s (grace {grace:.1f}s)."
+                    )
+                    return
+
                 self.logger.info(
                     f"Firing now — {abs(late):.2f}s "
-                    f"{'after' if late > 0 else 'before'} entry {signal['entry_time']}."
+                    f"{'after' if late > 0 else 'before'} entry {signal['entry_time']} "
+                    f"(must send within {not_after - time.time():.1f}s)."
                 )
 
             # ── Step 4: Place trade ───────────────────────────────
@@ -225,6 +247,7 @@ class SignalExecutor:
             success = await self.quotex_handler.perform_trade(
                 asset, direction, expiry=expiry,
                 pre_configured_amount=pre_configured_amount,
+                not_after=not_after,
             )
 
             if success:
@@ -234,7 +257,13 @@ class SignalExecutor:
                     f"QUOTEX_TRADE_EXECUTED | {json.dumps(signal)}"
                 )
             else:
-                self.logger.error("Trade execution failed.")
+                # The reason was already logged by QuotexHandler (gate hit,
+                # asset unavailable, or an unconfirmed order with its diagnosis).
+                self.logger.error(
+                    f"Trade execution failed for {asset} {direction.upper()} "
+                    f"(entry {signal.get('entry_time') or 'immediate'}) — see the "
+                    f"reason logged just above."
+                )
 
         except Exception as e:
             self.logger.error(f"Error executing trade {sid}: {e}")

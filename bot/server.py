@@ -103,12 +103,34 @@ _server_state: dict = {"alert": None, "quotex_connected": False}
 _otp_future: Optional[asyncio.Future] = None
 
 
+MAX_OTP_ATTEMPTS = 3
+
+
 def _make_otp_callback():
-    """Async on_otp_callback for pyquotex — resolved by POST /api/quotex/pin."""
+    """
+    Async on_otp_callback for pyquotex — resolved by POST /api/quotex/pin.
+
+    Attempts are capped. pyquotex's awaiting_pin() re-invokes this callback by
+    RECURSION on any empty or non-digit code, with no limit and no delay
+    (network/login.py:91-93), so returning "" forever would spin the login
+    until it blew the recursion limit. After MAX_OTP_ATTEMPTS we raise instead,
+    which unwinds that recursion and fails the connect cleanly.
+    """
+    attempts = {"n": 0}
+
     async def callback(message: str) -> str:
         global _otp_future
+        attempts["n"] += 1
+        if attempts["n"] > MAX_OTP_ATTEMPTS:
+            socketio.emit("quotex_otp_failed",
+                          {"message": "PIN not provided — login aborted."})
+            raise RuntimeError(
+                f"Quotex PIN not supplied after {MAX_OTP_ATTEMPTS} prompts — aborting login."
+            )
+
         _otp_future = asyncio.get_running_loop().create_future()
-        socketio.emit("quotex_otp_required", {"message": str(message)})
+        socketio.emit("quotex_otp_required",
+                      {"message": str(message), "attempt": attempts["n"]})
         try:
             return await asyncio.wait_for(asyncio.shield(_otp_future), timeout=300)
         except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -216,6 +238,7 @@ def get_bot_state() -> dict:
         "daily_pnl":       qh.daily_pnl if qh else 0.0,
         "daily_loss":      qh.daily_loss if qh else 0.0,
         "balance":         qh.balance if qh else None,
+        "day_open_balance": qh._day_start_balance if qh else None,
         "account_type":    (qh.config.trading.account_type if qh
                             else trading.get("account_type", "demo")),
         "risk_mode":       (qh.config.trading.risk_mode if qh
@@ -472,7 +495,7 @@ def _broadcast_state():
             if (_bot_instance is None and _shared_quotex is not None
                     and _shared_quotex.is_connected and now - last_balance_poll > 10):
                 last_balance_poll = now
-                submit(_shared_quotex._refresh_balance_stats())
+                submit(_shared_quotex._refresh_balance_stats(authoritative=True))
 
             state = get_bot_state()
             state["connections"] = get_connection_status()

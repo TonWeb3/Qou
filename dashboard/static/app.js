@@ -132,7 +132,11 @@ function updateMetrics(s) {
   const pnl   = Number(s.daily_pnl ?? 0);
   pnlEl.textContent = fmtSigned(pnl, isPct);
   pnlEl.className   = 'metric-value ' + (pnl >= 0 ? 'text-green' : 'text-red');
-  $('metric-pnl-sub').textContent = isPct ? 'Daily P&L (% of balance)' : 'Realized daily P&L';
+  const dayOpen = s.day_open_balance;
+  $('metric-pnl-sub').textContent =
+    dayOpen === null || dayOpen === undefined
+      ? (isPct ? 'Daily P&L (% of balance)' : 'Realized daily P&L')
+      : `since today's open ${fmtMoney(dayOpen, false)}`;
 
   // Win rate
   const wins = s.wins ?? 0, losses = s.losses ?? 0, total = wins + losses;
@@ -563,6 +567,7 @@ async function loadSettings() {
   setValue('s-qx-email',    q.email    || '');
   setValue('s-qx-password', q.password || '');
   setValue('s-early-entry', q.early_entry_seconds ?? 0.5);
+  setValue('s-late-grace',  q.late_entry_grace_seconds ?? 5);
 
   // Trading
   setValue('s-account-type', tr.account_type || 'demo');
@@ -690,6 +695,7 @@ function buildConfigFromForm() {
       email:               $('s-qx-email').value.trim(),
       password:            $('s-qx-password').value,
       early_entry_seconds: Math.min(5, Math.max(0, parseFloat($('s-early-entry').value) || 0)),
+      late_entry_grace_seconds: Math.min(60, Math.max(0, parseFloat($('s-late-grace').value) || 5)),
     },
     trading: {
       account_type:          $('s-account-type').value,

@@ -22,6 +22,13 @@ class QuotexConfig:
     email: str = ""
     password: str = ""
     early_entry_seconds: float = 0.5   # latency lead: fire this many seconds before the entry second
+    # Grace period: if the order cannot be sent within this many seconds of the
+    # intended firing moment, the signal is dropped instead of entered late.
+    late_entry_grace_seconds: float = 5.0
+    # Order style. "TIMER" = fixed duration from the fill (optionType 100).
+    # "TURBO" = candle-aligned expiry (optionType 1) — fall back to it if Quotex
+    # stops acknowledging duration orders on an asset.
+    time_mode: str = "TIMER"
 
 
 @dataclass
@@ -75,6 +82,10 @@ class Config:
                     email=quotex_data.get('email', ''),
                     password=quotex_data.get('password', ''),
                     early_entry_seconds=float(quotex_data.get('early_entry_seconds', 0.5)),
+                    late_entry_grace_seconds=float(
+                        quotex_data.get('late_entry_grace_seconds', 5.0)
+                    ),
+                    time_mode=quotex_data.get('time_mode', 'TIMER'),
                 )
 
                 tg_data = config_data.get('telegram', {})
@@ -130,6 +141,8 @@ class Config:
                     'email':              self.quotex.email,
                     'password':           self.quotex.password,
                     'early_entry_seconds': self.quotex.early_entry_seconds,
+                    'late_entry_grace_seconds': self.quotex.late_entry_grace_seconds,
+                    'time_mode':           self.quotex.time_mode,
                 },
                 'telegram': {
                     'api_id':          self.telegram.api_id,
