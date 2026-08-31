@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
 
 BASE_DIR     = Path(__file__).parent.parent          # QUOTEX1 root
@@ -26,44 +26,95 @@ app = Flask(
 app.config["SECRET_KEY"] = "qx-dashboard-2026"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+# ═══════════════════════════════════════════════════════════
+#  SHARED ASYNC RUNTIME
+#  ONE event loop for the entire process. Every async thing — the Quotex
+#  session, the Telegram auth client, the trading bot — lives on it.
+#  That matters for two reasons:
+#    1. A Quotex session opened from Settings is the SAME live object the bot
+#       later uses. aiohttp/websocket connections are bound to the loop that
+#       created them, so a per-request loop could never be handed over; the
+#       old code had to disconnect right after testing, forcing the bot to log
+#       in again (and re-trigger the email PIN).
+#    2. Per-request loops were created, run once and abandoned while their
+#       tasks were still scheduled — which is exactly what printed
+#       "Task was destroyed but it is pending!". This loop is never closed.
+# ═══════════════════════════════════════════════════════════
+
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_loop_lock  = threading.Lock()
+_loop_ready = threading.Event()
+
+
+def _runtime() -> asyncio.AbstractEventLoop:
+    """Return the shared event loop, starting its thread on first use."""
+    global _loop
+    with _loop_lock:
+        if _loop is not None and not _loop.is_closed():
+            return _loop
+        _loop_ready.clear()
+
+        def _runner():
+            global _loop
+            if sys.platform == "win32":
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            _loop = loop
+            _loop_ready.set()
+            loop.run_forever()
+
+        threading.Thread(target=_runner, daemon=True, name="async-runtime").start()
+        if not _loop_ready.wait(timeout=10):
+            raise RuntimeError("async runtime failed to start")
+        return _loop
+
+
+def submit(coro):
+    """Schedule a coroutine on the shared loop; returns a concurrent Future."""
+    return asyncio.run_coroutine_threadsafe(coro, _runtime())
+
+
+def run_sync(coro, timeout: float = 30):
+    """Run a coroutine on the shared loop and wait for its result."""
+    return submit(coro).result(timeout=timeout)
+
+
 # ─── Shared state ────────────────────────────────────────────
 
-_tg_client_store: dict = {}   # holds live Telethon client during auth
+_tg_client_store: dict = {}   # holds the live Telethon client during auth
 
-# Live reference to the TradingBot — set by main.py when bot starts in-process.
+# Live reference to the TradingBot — set by main.py when the bot starts.
 _bot_instance = None
 
-# Bot thread + event loop — the bot runs in a background thread with its own loop.
-_bot_thread: Optional[threading.Thread] = None
-_bot_loop:   Optional[asyncio.AbstractEventLoop] = None
+# The running TradingBot.start() task (a concurrent.futures.Future).
+_bot_task = None
+
+# The Quotex session opened from Settings. Kept ALIVE and handed to the bot.
+_shared_quotex = None
 
 # Fallback store when bot is not running — tracks alert and last known Quotex connection
 _server_state: dict = {"alert": None, "quotex_connected": False}
 
 # ── OTP / PIN coordination ─────────────────────────────────
-# Used when Quotex requires an email PIN during login.
-# The connect thread blocks on _otp_event; /api/quotex/pin sets the value and fires it.
-_otp_event: threading.Event = threading.Event()
-_otp_value: Optional[str] = None
+# When Quotex emails a PIN, pyquotex awaits our callback (it supports async
+# callbacks). We await a Future instead of blocking a thread, so the shared
+# loop keeps serving the bot and the balance monitor while the user types.
+_otp_future: Optional[asyncio.Future] = None
 
 
-def _make_otp_callback() -> callable:
-    """
-    Returns a sync callback to pass as on_otp_callback to pyquotex.
-    When called, it emits quotex_otp_required to the dashboard and blocks
-    up to 5 minutes for the user to submit the PIN via /api/quotex/pin.
-    """
-    global _otp_value
-    _otp_event.clear()
-    _otp_value = None
-
-    def callback(message: str) -> str:
-        global _otp_value
+def _make_otp_callback():
+    """Async on_otp_callback for pyquotex — resolved by POST /api/quotex/pin."""
+    async def callback(message: str) -> str:
+        global _otp_future
+        _otp_future = asyncio.get_running_loop().create_future()
         socketio.emit("quotex_otp_required", {"message": str(message)})
-        got_it = _otp_event.wait(timeout=300)    # blocks thread, not event loop
-        if not got_it:
+        try:
+            return await asyncio.wait_for(asyncio.shield(_otp_future), timeout=300)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             return ""
-        return _otp_value or ""
+        finally:
+            _otp_future = None
 
     return callback
 
@@ -135,54 +186,51 @@ def _pending_signals(th) -> list:
     return out
 
 
+def _quotex_is_connected() -> bool:
+    """True when a live Quotex session exists — the bot's, or the shared one."""
+    if _bot_instance is not None and _bot_instance.quotex_handler is not None:
+        return bool(_bot_instance.quotex_handler.is_connected)
+    if _shared_quotex is not None:
+        return bool(_shared_quotex.is_connected)
+    return bool(_server_state.get("quotex_connected", False))
+
+
 def get_bot_state() -> dict:
-    """Return live bot state — reads directly from the running TradingBot instance."""
+    """
+    Live bot state. Figures come from whichever QuotexHandler is alive — the
+    bot's while it runs, otherwise the shared session opened from Settings —
+    so the dashboard keeps showing the balance with the bot stopped.
+    """
     bot = _bot_instance
     cfg = _read_json(BASE_DIR / "config.json")
     trading = cfg.get("trading", {})
 
-    if bot is not None:
-        qh = bot.quotex_handler
-        th = bot.telegram_handler
-        pending = _pending_signals(th)
-        return {
-            "status":          "running" if bot.running else "stopped",
-            "daily_trades":    qh.daily_trades if qh else 0,
-            "wins":            qh.wins if qh else 0,
-            "losses":          qh.losses if qh else 0,
-            "daily_pnl":       qh.daily_pnl if qh else 0.0,
-            "daily_loss":      qh.daily_loss if qh else 0.0,
-            "balance":         qh.balance if qh else None,
-            "account_type":    (qh.config.trading.account_type if qh
-                                else trading.get("account_type", "demo")),
-            "risk_mode":       qh.config.trading.risk_mode if qh else "fixed",
-            "max_daily_trades":       trading.get("max_daily_trades", 0),
-            "max_daily_loss":         trading.get("max_daily_loss", 0),
-            "max_daily_loss_enabled": trading.get("max_daily_loss_enabled", True),
-            "active_trades":   qh.active_trades if qh else 0,
-            "max_concurrent_trades":  trading.get("max_concurrent_trades", 1),
-            "last_trade":      qh.last_trade if qh else None,
-            "pending":         pending,
-            "active_signals":  len(pending),
-            "alert":           bot.alert,
-            "quotex_connected": qh.is_connected if qh else False,
-            "bot_running":     bot.running,
-        }
+    qh      = (bot.quotex_handler if bot is not None else None) or _shared_quotex
+    pending = _pending_signals(bot.telegram_handler) if bot is not None else []
+
     return {
-        "status": "stopped", "daily_trades": 0, "wins": 0, "losses": 0,
-        "daily_pnl": 0.0, "daily_loss": 0.0,
-        "balance": None,
-        "account_type": trading.get("account_type", "demo"),
-        "risk_mode": (trading.get("risk_mode") or "fixed"),
+        "status":          "running" if (bot is not None and bot.running) else "stopped",
+        "daily_trades":    qh.daily_trades if qh else 0,
+        "wins":            qh.wins if qh else 0,
+        "losses":          qh.losses if qh else 0,
+        "daily_pnl":       qh.daily_pnl if qh else 0.0,
+        "daily_loss":      qh.daily_loss if qh else 0.0,
+        "balance":         qh.balance if qh else None,
+        "account_type":    (qh.config.trading.account_type if qh
+                            else trading.get("account_type", "demo")),
+        "risk_mode":       (qh.config.trading.risk_mode if qh
+                            else (trading.get("risk_mode") or "fixed")),
         "max_daily_trades":       trading.get("max_daily_trades", 0),
         "max_daily_loss":         trading.get("max_daily_loss", 0),
         "max_daily_loss_enabled": trading.get("max_daily_loss_enabled", True),
-        "active_trades": 0,
+        "active_trades":          qh.active_trades if qh else 0,
         "max_concurrent_trades":  trading.get("max_concurrent_trades", 1),
-        "last_trade": None, "pending": [], "active_signals": 0,
-        "alert":            _server_state.get("alert"),
-        "quotex_connected": bool(_server_state.get("quotex_connected", False)),
-        "bot_running":      _bot_thread is not None and _bot_thread.is_alive(),
+        "last_trade":      qh.last_trade if qh else None,
+        "pending":         pending,
+        "active_signals":  len(pending),
+        "alert":           bot.alert if bot is not None else _server_state.get("alert"),
+        "quotex_connected": _quotex_is_connected(),
+        "bot_running":     _bot_is_running(),
     }
 
 
@@ -193,12 +241,7 @@ def get_connection_status() -> dict:
     session_data = _read_json(BASE_DIR / f"{session_name}.json")
     telegram_ok  = bool(session_data.get("session_string"))
 
-    if _bot_instance is not None and _bot_instance.quotex_handler is not None:
-        quotex_ok = _bot_instance.quotex_handler.is_connected
-    else:
-        quotex_ok = bool(_server_state.get("quotex_connected", False))
-
-    return {"telegram": telegram_ok, "quotex": quotex_ok}
+    return {"telegram": telegram_ok, "quotex": _quotex_is_connected()}
 
 
 # ─── Routes ──────────────────────────────────────────────────
@@ -241,65 +284,68 @@ def save_settings():
 
 # ─── Bot start / stop ─────────────────────────────────────────
 
-def _run_trading_bot():
+def _bot_is_running() -> bool:
+    return _bot_task is not None and not _bot_task.done()
+
+
+async def _run_trading_bot():
     """
-    Entry point for the bot thread.
-    Creates its own asyncio event loop and runs TradingBot.start().
-    The loop — and therefore the bot — live until start() returns or shutdown() is called.
+    Run TradingBot.start() on the shared loop, handing it the Quotex session
+    that Settings already opened (if any) so it is NOT re-established.
     """
-    global _bot_loop, _bot_instance
-
-    import sys as _sys
-    if _sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    loop = asyncio.new_event_loop()
-    _bot_loop = loop
-    asyncio.set_event_loop(loop)
-
+    global _bot_instance
+    from main import TradingBot
+    bot = TradingBot(quotex_handler=_shared_quotex)
     try:
-        from main import TradingBot
-        bot = TradingBot()
-        loop.run_until_complete(bot.start())
+        await bot.start()
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"[bot] Fatal error: {e}")
     finally:
         _bot_instance = None
-        _bot_loop     = None
         _server_state["alert"] = None
         socketio.emit("bot_status", {"running": False})
-        try:
-            loop.close()
-        except Exception:
-            pass
 
 
 @app.route("/api/bot/start", methods=["POST"])
 def bot_start():
-    global _bot_thread
-    if _bot_thread and _bot_thread.is_alive():
+    global _bot_task
+    if _bot_is_running():
         return jsonify({"success": False, "message": "Bot already running"})
 
     _server_state["alert"] = None
-    _bot_thread = threading.Thread(target=_run_trading_bot, daemon=True, name="trading-bot")
-    _bot_thread.start()
+    _bot_task = submit(_run_trading_bot())
     return jsonify({"success": True})
 
 
 @app.route("/api/bot/stop", methods=["POST"])
 def bot_stop():
-    global _bot_instance, _bot_loop
-    bot  = _bot_instance
-    loop = _bot_loop
-    if bot and loop and loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(bot.shutdown(), loop)
+    """
+    Stop the bot cleanly: ask it to shut down (which disconnects Telegram and
+    cancels its background tasks), then wait briefly for start() to unwind.
+    The Quotex session opened from Settings is deliberately left connected.
+    """
+    global _bot_task
+    bot = _bot_instance
+    if not (bot and _bot_is_running()):
+        return jsonify({"success": False, "message": "Bot not running"})
+
+    try:
+        run_sync(bot.shutdown(), timeout=15)
+    except Exception as e:
+        print(f"[bot] shutdown error: {e}")
+
+    task = _bot_task
+    if task is not None:
         try:
-            future.result(timeout=10)
+            task.result(timeout=10)      # start() returns once Telegram disconnects
         except Exception:
-            pass
-        socketio.emit("bot_status", {"running": False})
-        return jsonify({"success": True})
-    return jsonify({"success": False, "message": "Bot not running"})
+            task.cancel()                # last resort — never leave it pending
+    _bot_task = None
+
+    socketio.emit("bot_status", {"running": False})
+    return jsonify({"success": True})
 
 
 def _patch_state(patch: dict):
@@ -317,28 +363,94 @@ def _patch_state(patch: dict):
         _server_state["quotex_connected"] = bool(patch["quotex_connected"])
 
 
-# ─── Log file tailing ─────────────────────────────────────────
+# ─── Log file: history, live tail, download ───────────────────
+
+def _log_path() -> Path:
+    """The log file the bot is actually writing to (honours logging.log_file)."""
+    cfg  = _read_json(BASE_DIR / "config.json")
+    name = (cfg.get("logging", {}) or {}).get("log_file") or "quotex_bot.log"
+    return BASE_DIR / "logs" / name
+
+
+def _parse_log_line(line: str) -> dict:
+    """Split a written log line into the shape the dashboard renders."""
+    level = "ERROR" if "ERROR" in line else "WARNING" if "WARNING" in line else "INFO"
+    # File format: "YYYY-MM-DD HH:MM:SS | logger | LEVEL | message"
+    stamp = line[11:19] if (len(line) > 19 and line[4] == "-" and line[13] == ":") else ""
+    return {
+        "message": line,
+        "level":   level,
+        "time":    stamp or datetime.now().strftime("%H:%M:%S"),
+    }
+
+
+@app.route("/api/logs")
+def api_logs():
+    """
+    Recent log lines, so reloading the page restores history instead of showing
+    an empty console. The live tail below only streams what arrives afterwards.
+    """
+    try:
+        limit = max(1, min(int(request.args.get("lines", 400)), 5000))
+    except (TypeError, ValueError):
+        limit = 400
+
+    path  = _log_path()
+    lines = []
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.readlines()[-limit:]
+            lines = [_parse_log_line(l.rstrip("\n")) for l in raw if l.strip()]
+        except Exception as e:
+            lines = [{"message": f"Could not read {path.name}: {e}",
+                      "level": "ERROR", "time": datetime.now().strftime("%H:%M:%S")}]
+
+    resp = jsonify({"file": path.name, "exists": path.exists(), "lines": lines})
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
+@app.route("/api/logs/download")
+def api_logs_download():
+    """Download the full log file."""
+    path = _log_path()
+    if not path.exists():
+        return jsonify({"success": False, "message": "No log file yet."}), 404
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=f"quotex1-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log",
+        mimetype="text/plain",
+    )
+
 
 def _tail_log_file():
-    """When bot is not a subprocess (e.g. restarted externally), tail its log."""
-    log_path = BASE_DIR / "logs" / "quotex_bot.log"
+    """
+    Stream newly written log lines to connected dashboards.
+    Starts at the CURRENT end of the file — history is served by /api/logs, so
+    a restart must not replay the whole file into everyone's console.
+    """
+    last_path = None
     last_size = 0
     while True:
         try:
+            log_path = _log_path()
+            if log_path != last_path:                 # log_file changed in Settings
+                last_path = log_path
+                last_size = log_path.stat().st_size if log_path.exists() else 0
+
             if log_path.exists():
                 size = log_path.stat().st_size
+                if size < last_size:                  # rotated or truncated
+                    last_size = 0
                 if size > last_size:
                     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                         f.seek(last_size)
                         for line in f:
                             line = line.strip()
                             if line:
-                                level = ("ERROR" if "ERROR" in line
-                                         else "WARNING" if "WARNING" in line else "INFO")
-                                socketio.emit("log", {
-                                    "message": line, "level": level,
-                                    "time": datetime.now().strftime("%H:%M:%S"),
-                                })
+                                socketio.emit("log", _parse_log_line(line))
                     last_size = size
         except Exception:
             pass
@@ -349,9 +461,19 @@ def _tail_log_file():
 
 def _broadcast_state():
     """Push state updates to all connected clients every 3 seconds."""
+    last_balance_poll = 0.0
     while True:
         time.sleep(3)
         try:
+            # With the bot stopped, nothing else refreshes the shared session's
+            # balance — do it here (every 10 s) so Settings → Connect immediately
+            # shows real figures. The bot's own monitor covers the running case.
+            now = time.monotonic()
+            if (_bot_instance is None and _shared_quotex is not None
+                    and _shared_quotex.is_connected and now - last_balance_poll > 10):
+                last_balance_poll = now
+                submit(_shared_quotex._refresh_balance_stats())
+
             state = get_bot_state()
             state["connections"] = get_connection_status()
             socketio.emit("state_update", state)
@@ -376,38 +498,41 @@ def telegram_connect():
     api_id   = config.get("telegram", {}).get("api_id")
     api_hash = config.get("telegram", {}).get("api_hash", "")
 
-    result: dict = {"success": False, "message": ""}
-
-    def _run():
+    async def _send():
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         client = TelegramClient(StringSession(), api_id, api_hash)
-
-        async def _send():
+        try:
             await client.connect()
             await client.send_code_request(phone)
-
-        try:
-            loop.run_until_complete(_send())
-            _tg_client_store["client"] = client
-            _tg_client_store["loop"]   = loop
-            _tg_client_store["phone"]  = phone
-            result["success"] = True
-        except Exception as e:
-            result["message"] = str(e)
+        except Exception:
             try:
-                loop.run_until_complete(client.disconnect())
+                await client.disconnect()
             except Exception:
                 pass
+            raise
+        # The client stays alive on the shared loop between the code/2FA steps.
+        _tg_client_store["client"] = client
+        _tg_client_store["phone"]  = phone
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=20)
+    try:
+        run_sync(_send(), timeout=30)
+        return jsonify({"success": True, "message": ""})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
 
-    return jsonify(result)
+
+def _save_tg_session(client, phone):
+    """Persist the authorized Telethon StringSession, then release the client."""
+    session_str  = client.session.save()
+    config       = _read_json(BASE_DIR / "config.json")
+    session_name = config.get("telegram", {}).get("session_name", "quotex_bot_session")
+    (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
+        "session_string": session_str,
+        "phone_number":   phone,
+        "saved_at":       datetime.now().isoformat(),
+    }))
 
 
 @app.route("/api/telegram/verify", methods=["POST"])
@@ -415,44 +540,28 @@ def telegram_verify():
     data   = request.get_json(force=True)
     code   = (data.get("code") or "").strip()
     client = _tg_client_store.get("client")
-    loop   = _tg_client_store.get("loop")
     phone  = _tg_client_store.get("phone")
 
-    if not (client and loop and phone):
+    if not (client and phone):
         return jsonify({"success": False, "message": "No auth session active — send code first"}), 400
 
-    result: dict = {"success": False, "message": ""}
+    async def _verify() -> dict:
+        try:
+            await client.sign_in(phone, code)
+        except Exception as e:
+            if "password" in str(e).lower():
+                return {"success": False, "needs_password": True,
+                        "message": "2FA password required"}
+            return {"success": False, "message": str(e)}
+        _save_tg_session(client, phone)
+        await client.disconnect()
+        _tg_client_store.clear()
+        return {"success": True, "message": ""}
 
-    def _run():
-        async def _verify():
-            try:
-                await client.sign_in(phone, code)
-            except Exception as e:
-                # 2FA / password required
-                if "password" in str(e).lower():
-                    result["needs_password"] = True
-                    result["message"] = "2FA password required"
-                    return
-                result["message"] = str(e)
-                return
-
-            session_str  = client.session.save()
-            config       = _read_json(BASE_DIR / "config.json")
-            session_name = config.get("telegram", {}).get("session_name", "quotex_bot_session")
-            (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
-                "session_string": session_str,
-                "phone_number":   phone,
-                "saved_at":       datetime.now().isoformat(),
-            }))
-            result["success"] = True
-            await client.disconnect()
-            _tg_client_store.clear()
-
-        loop.run_until_complete(_verify())
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=20)
+    try:
+        result = run_sync(_verify(), timeout=30)
+    except Exception as e:
+        result = {"success": False, "message": str(e)}
 
     if result.get("success"):
         socketio.emit("connection_update", {"telegram": True})
@@ -465,37 +574,25 @@ def telegram_password():
     data     = request.get_json(force=True)
     password = data.get("password", "")
     client   = _tg_client_store.get("client")
-    loop     = _tg_client_store.get("loop")
     phone    = _tg_client_store.get("phone")
 
-    if not (client and loop):
+    if not client:
         return jsonify({"success": False, "message": "No session active"}), 400
 
-    result: dict = {"success": False, "message": ""}
+    async def _pw() -> dict:
+        try:
+            await client.sign_in(password=password)
+            _save_tg_session(client, phone)
+            await client.disconnect()
+            _tg_client_store.clear()
+            return {"success": True, "message": ""}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
-    def _run():
-        async def _pw():
-            try:
-                await client.sign_in(password=password)
-                session_str  = client.session.save()
-                config       = _read_json(BASE_DIR / "config.json")
-                session_name = config.get("telegram", {}).get("session_name", "quotex_bot_session")
-                (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
-                    "session_string": session_str,
-                    "phone_number":   phone,
-                    "saved_at":       datetime.now().isoformat(),
-                }))
-                result["success"] = True
-                await client.disconnect()
-                _tg_client_store.clear()
-            except Exception as e:
-                result["message"] = str(e)
-
-        loop.run_until_complete(_pw())
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=20)
+    try:
+        result = run_sync(_pw(), timeout=30)
+    except Exception as e:
+        result = {"success": False, "message": str(e)}
 
     if result.get("success"):
         socketio.emit("connection_update", {"telegram": True})
@@ -538,55 +635,73 @@ def quotex_connect():
     except Exception as e:
         return jsonify({"success": False, "message": f"Could not save config: {e}"}), 500
 
-    # Build the OTP callback before starting the thread so the event is ready
-    otp_callback = _make_otp_callback()
-    result: dict = {"success": False, "message": ""}
+    async def _connect() -> tuple:
+        """Open (or keep) the shared Quotex session on the shared loop."""
+        global _shared_quotex
+        from bot.config import Config
+        from bot.quotex_handler import QuotexHandler
 
-    def _run():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Already live on these credentials? Reuse it — no second login, no PIN.
+        existing = _shared_quotex
+        if existing is not None and existing.is_connected:
+            if (existing.config.quotex.email == email
+                    and existing.config.quotex.password == password):
+                return True, "Already connected — reusing the live session."
+            await existing.disconnect()      # credentials changed: replace it
+            _shared_quotex = None
 
-        async def _test():
-            from bot.config import Config
-            from bot.quotex_handler import QuotexHandler
-            config  = Config(str(BASE_DIR / "config.json"))
-            handler = QuotexHandler(config)
-            connected = await handler.connect(otp_callback=otp_callback)
-            if connected:
-                result["success"] = True
-                _patch_state({"quotex_connected": True, "alert": None})
-                socketio.emit("connection_update", {"quotex": True})
-            else:
-                result["message"] = "Login failed — check your email/password."
-                _patch_state({"quotex_connected": False})
-            await handler.disconnect()
+        handler = QuotexHandler(Config(str(BASE_DIR / "config.json")))
+        if await handler.connect(otp_callback=_make_otp_callback()):
+            _shared_quotex = handler         # KEEP it alive for the bot to adopt
+            return True, ""
+        await handler.disconnect()
+        _shared_quotex = None
+        return False, "Login failed — check your email/password."
 
-        loop.run_until_complete(_test())
+    try:
+        # Generous timeout: the user may need minutes to fetch the emailed PIN.
+        ok, message = run_sync(_connect(), timeout=600)
+    except Exception as e:
+        _patch_state({"quotex_connected": False})
+        return jsonify({"success": False, "message": f"Connection error: {e}"})
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    # Wait longer (up to 10 min) to allow time for OTP entry
-    t.join(timeout=600)
-
-    return jsonify(result)
+    if ok:
+        _patch_state({"quotex_connected": True, "alert": None})
+        socketio.emit("connection_update", {"quotex": True})
+    else:
+        _patch_state({"quotex_connected": False})
+    return jsonify({"success": ok, "message": message})
 
 
 @app.route("/api/quotex/pin", methods=["POST"])
 def quotex_pin():
-    """Receive the PIN the user typed and unblock the waiting connect thread."""
-    global _otp_value
+    """Receive the PIN the user typed and resolve the awaiting OTP future."""
     data = request.get_json(force=True)
     pin  = (data.get("pin") or "").strip()
     if not pin:
         return jsonify({"success": False, "message": "PIN is required."}), 400
-    _otp_value = pin
-    _otp_event.set()
+
+    fut = _otp_future
+    if fut is None or fut.done():
+        return jsonify({"success": False, "message": "No PIN request is waiting."}), 400
+
+    # The future belongs to the shared loop — resolve it from that loop's thread.
+    _runtime().call_soon_threadsafe(lambda: fut.done() or fut.set_result(pin))
     return jsonify({"success": True})
 
 
 @app.route("/api/quotex/disconnect", methods=["POST"])
 def quotex_disconnect():
-    """Clear saved Quotex credentials and mark as disconnected."""
+    """Close the live Quotex session and clear the saved credentials."""
+    global _shared_quotex
+
+    if _shared_quotex is not None:
+        try:
+            run_sync(_shared_quotex.disconnect(), timeout=15)
+        except Exception:
+            pass
+        _shared_quotex = None
+
     cfg = _read_json(BASE_DIR / "config.json")
     cfg.setdefault("quotex", {})["email"]    = ""
     cfg.setdefault("quotex", {})["password"] = ""
@@ -611,6 +726,7 @@ def on_connect():
 # ─── Entry point ─────────────────────────────────────────────
 
 def start_server(host="0.0.0.0", port=5000):
+    _runtime()          # start the shared event loop before serving requests
     threading.Thread(target=_tail_log_file,    daemon=True).start()
     threading.Thread(target=_broadcast_state,  daemon=True).start()
     print(f"\n  QUOTEX1 Dashboard → http://localhost:{port}\n")

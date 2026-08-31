@@ -298,9 +298,30 @@ function addLog(time, msg, level = 'INFO') {
   }
 }
 
+/**
+ * Load the tail of the log FILE so a page reload shows history instead of an
+ * empty console. Live lines keep streaming in over SocketIO afterwards.
+ */
+async function loadLogHistory(lines = 300) {
+  const res = await api('GET', `/api/logs?lines=${lines}`);
+  if (!res || !Array.isArray(res.lines)) return;
+  logPanel.innerHTML = '';
+  if (!res.lines.length) {
+    addLog(now(), res.exists ? `${res.file} is empty` : 'No log file yet — start the bot', 'INFO');
+    return;
+  }
+  res.lines.forEach(l => addLog(l.time, l.message, l.level));
+  addLog(now(), `— ${res.lines.length} earlier lines loaded from ${res.file} —`, 'INFO');
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
 $('btn-clear-log')?.addEventListener('click', () => {
   logPanel.innerHTML = '';
-  addLog(now(), 'Log cleared', 'INFO');
+  addLog(now(), 'View cleared — the log file is untouched. Reload to see history again.', 'INFO');
+});
+
+$('btn-download-log')?.addEventListener('click', () => {
+  window.location.href = '/api/logs/download';
 });
 
 function escHtml(s) {
@@ -754,6 +775,7 @@ function showFieldError(id, msg) {
 // ── Init ──────────────────────────────────────────────────
 (async () => {
   await loadSettings();
+  await loadLogHistory();
 
   // Initial status fetch
   const status = await api('GET', '/api/status');

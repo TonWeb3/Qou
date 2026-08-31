@@ -314,12 +314,14 @@ class TelegramHandler:
             self.logger.info("Initializing Telegram client...")
             self._load_session()
 
-            if not self.phone_number:
-                print("\n" + "=" * 60)
-                print("    TELEGRAM LOGIN REQUIRED")
-                print("=" * 60)
-                print("Get API credentials from: https://my.telegram.org/apps\n")
-                self.phone_number = input("Enter your phone number (with country code): ").strip()
+            if not (self.session_string and self.phone_number):
+                # The bot runs inside the dashboard's event loop — there is no
+                # console to prompt on, and blocking here would hang the runtime.
+                self.logger.error(
+                    "Telegram is not signed in. Open the dashboard -> Settings -> "
+                    "Connections -> Telegram and connect, then start the bot again."
+                )
+                return False
 
             session = StringSession(self.session_string) if self.session_string else StringSession()
             self.client = TelegramClient(session, self.api_id, self.api_hash)

@@ -32,11 +32,19 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 class TradingBot:
     """Trading bot — holds all live state as plain attributes on real objects."""
 
-    def __init__(self):
+    def __init__(self, quotex_handler=None):
+        """
+        quotex_handler: an already-connected QuotexHandler to ADOPT (the session
+        the dashboard opened from Settings). When given, the bot reuses that live
+        session instead of logging in again — no second login, no repeated email
+        PIN — and leaves it connected when it stops, since it does not own it.
+        """
         self.config           = None
         self.logger           = None
         self.telegram_handler = None
-        self.quotex_handler   = None
+        self.quotex_handler   = quotex_handler
+        self._owns_quotex     = quotex_handler is None
+        self._tasks: list     = []      # background tasks, cancelled on shutdown
         self.running          = False
         self.alert: str | None = None   # last error message for the dashboard
 
@@ -57,7 +65,14 @@ class TradingBot:
                 self.logger.error("Configuration validation failed.")
                 return False
 
-            self.quotex_handler   = QuotexHandler(self.config)
+            if self.quotex_handler is None:
+                self.quotex_handler = QuotexHandler(self.config)
+                self._owns_quotex   = True
+            else:
+                self.logger.info(
+                    "Adopting the Quotex session already open in the dashboard "
+                    f"(connected={self.quotex_handler.is_connected})."
+                )
             self.telegram_handler = TelegramHandler(self.config)
 
             # Register with the dashboard so it can read live state from memory
@@ -76,7 +91,11 @@ class TradingBot:
                 return False
 
             # Quotex connection is optional at start — credentials may be set later
-            if self.quotex_handler._has_credentials():
+            if self.quotex_handler.is_connected:
+                # Adopted a live session from the dashboard — do NOT log in again.
+                self.logger.info("Quotex already connected — reusing the open session.")
+                self.alert = None
+            elif self.quotex_handler._has_credentials():
                 if await self.quotex_handler.connect():
                     self.logger.info("Quotex connected.")
                     self.alert = None
@@ -92,8 +111,12 @@ class TradingBot:
 
             self.running = True
             self.logger.info("Bot started — monitoring Telegram for signals.")
-            asyncio.ensure_future(self._health_monitor())
-            asyncio.ensure_future(self._balance_monitor())
+            # Keep references so shutdown() can cancel them. Fire-and-forget tasks
+            # are what get reported as "Task was destroyed but it is pending!".
+            self._tasks = [
+                asyncio.ensure_future(self._health_monitor()),
+                asyncio.ensure_future(self._balance_monitor()),
+            ]
             await self.telegram_handler.start_monitoring(self._handle_signal)
             return True
 
@@ -186,8 +209,20 @@ class TradingBot:
             if self.logger:
                 self.logger.info("Shutting down trading bot...")
 
-            if self.quotex_handler:
+            # Cancel the background monitors and wait for them to unwind, so no
+            # task is left pending when this coroutine returns.
+            for task in self._tasks:
+                task.cancel()
+            if self._tasks:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+
+            # Only close the Quotex session if this bot opened it. A session
+            # adopted from the dashboard stays connected after the bot stops.
+            if self.quotex_handler and self._owns_quotex:
                 await self.quotex_handler.disconnect()
+            elif self.logger:
+                self.logger.info("Leaving the dashboard's Quotex session connected.")
 
             if self.telegram_handler:
                 await self.telegram_handler.disconnect()
