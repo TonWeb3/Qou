@@ -25,9 +25,8 @@ class QuotexConfig:
     # Grace period: if the order cannot be sent within this many seconds of the
     # intended firing moment, the signal is dropped instead of entered late.
     late_entry_grace_seconds: float = 5.0
-    # Order style. "TIMER" = fixed duration from the fill (optionType 100).
-    # "TURBO" = candle-aligned expiry (optionType 1) — fall back to it if Quotex
-    # stops acknowledging duration orders on an asset.
+    # Order style, used for every asset. TIMER = optionType 100, a relative
+    # duration that runs from the fill (what the signals describe).
     time_mode: str = "TIMER"
 
 

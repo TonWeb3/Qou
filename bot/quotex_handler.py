@@ -22,6 +22,11 @@ try:
 except ImportError:
     Quotex = None
 
+# Route the WebSocket through a real browser TLS fingerprint. Without this
+# Cloudflare rejects the upgrade with HTTP 403 and NOTHING else works — see
+# bot/cf_transport.py for the measurements.
+from . import cf_transport
+
 # How long to wait for Quotex to acknowledge an order. pyquotex itself waits
 # duration+5s, but a 1-minute signal is worthless by then, so we cap it. NOTE:
 # the order is transmitted before this wait — a timeout means "unconfirmed",
@@ -80,7 +85,22 @@ class QuotexHandler:
             )
             return False
 
+        # Must be installed before any socket is opened, or Cloudflare 403s the
+        # handshake and every later step (auth, orders, balance) fails with it.
+        if not cf_transport.install():
+            self.logger.error(
+                "Cannot open a Quotex WebSocket without curl_cffi — "
+                "run:  pip install curl_cffi"
+            )
+            return False
+
         try:
+            # Retire any previous client FIRST. Its websocket has its own
+            # reconnect loop that keeps retrying forever on its own; leaving it
+            # orphaned is how the log accumulated 138 rejected handshakes while
+            # a newer client was already in use.
+            await self._retire_client()
+
             self.logger.info(f"Connecting to Quotex as {email}...")
             self.client = Quotex(
                 email=email,
@@ -110,6 +130,7 @@ class QuotexHandler:
                 await asyncio.sleep(5)
 
                 # Re-create the client so it reads the updated session file
+                await self._retire_client()
                 self.client = Quotex(
                     email=email,
                     password=password,
@@ -133,6 +154,10 @@ class QuotexHandler:
             target = account_map.get(self.config.trading.account_type.lower(), "PRACTICE")
             await self.client.change_account(target)
             self.logger.info(f"Account type: {target}")
+
+            # Every later socket (the watchdog recycles an idle one every 60 s)
+            # must re-authorize itself, or orders go into an anonymous socket.
+            self._install_reauth_hook()
 
             balance = await self.client.get_balance()
             self.logger.info(f"Connected. Balance: ${balance:.2f}")
@@ -169,32 +194,146 @@ class QuotexHandler:
         password = os.getenv("QUOTEX_PASSWORD") or self.config.quotex.password
         return bool(email and password)
 
+    # ─────────────────────────────────────────────────────────
+    #  WEBSOCKET AUTHORIZATION
+    # ─────────────────────────────────────────────────────────
+    #
+    # pyquotex sends the authorization frame (42["authorization", ...]) from
+    # ONE place only: api.connect() — the FIRST connection. Its auto-reconnect
+    # loop calls api._on_open(), which sends a heartbeat and a few list
+    # requests and never re-authorizes (api.py:231-258, send_ssid called only
+    # at api.py:943). The socket also recycles itself every time it goes 60 s
+    # without an inbound message ("watchdog-stale"), which for a bot that only
+    # waits for signals is constantly.
+    #
+    # So after the first recycle the socket is ANONYMOUS: public data
+    # (instruments, candles) still arrives, so every health check looks fine,
+    # but "orders/open" is silently discarded — no confirmation, no error.
+    # That is the 20-second timeout, on every asset, OTC or not.
+
+    def _install_reauth_hook(self):
+        """Re-send the authorization frame on EVERY socket open, not just the first."""
+        api = getattr(self.client, "api", None)
+        if api is None or getattr(api, "_qx1_reauth_installed", False):
+            return
+        original_on_open = api._on_open
+        handler = self
+
+        async def _on_open_with_reauth():
+            await original_on_open()
+            try:
+                from pyquotex.global_value import AuthStatus
+                # The new socket is unauthenticated until the server says
+                # otherwise — pyquotex leaves the old AUTHENTICATED flag set,
+                # which is what made every health check lie.
+                api.state.auth_status = AuthStatus.NOT_AUTHENTICATED
+            except Exception:
+                pass
+            try:
+                if await api.send_ssid():
+                    handler.logger.info("WebSocket re-opened — authorization re-sent.")
+                else:
+                    handler.logger.warning(
+                        "WebSocket re-opened but there is no session token to "
+                        "re-authorize with — a fresh login is needed."
+                    )
+            except Exception as e:
+                handler.logger.error(f"Could not re-authorize the new WebSocket: {e}")
+
+        api._on_open = _on_open_with_reauth
+        api._qx1_reauth_installed = True
+        self.logger.info("Re-authorization hook installed on the Quotex WebSocket.")
+
+    async def _ensure_authorized(self, timeout: float = 6.0) -> bool:
+        """
+        Make sure the CURRENT socket is authorized, re-sending the token if not.
+
+        Cheap when the session is healthy (one flag read). Called before every
+        order so a recycled socket can never swallow a trade.
+        """
+        api = getattr(self.client, "api", None)
+        if api is None:
+            return False
+        try:
+            from pyquotex.global_value import AuthStatus
+            from pyquotex._api._waits import wait_until
+        except Exception:
+            return True                      # can't verify — don't block the trade
+
+        if api.state.auth_status == AuthStatus.AUTHENTICATED:
+            return True
+        if api.websocket is None:
+            self.logger.warning("No live WebSocket to authorize.")
+            return False
+        try:
+            await api.send_ssid()
+            await wait_until(
+                lambda: api.state.auth_status == AuthStatus.AUTHENTICATED,
+                timeout=timeout, poll_interval=0.05,
+            )
+            self.logger.info("WebSocket re-authorized.")
+            return True
+        except Exception as e:
+            self.logger.warning(f"WebSocket authorization failed: {e}")
+            return False
+
     async def _connection_alive(self) -> bool:
         """
-        True only while the WebSocket is still AUTHENTICATED with Quotex.
+        True only if the CURRENT socket is open and the broker still accepts it.
 
-        The previous check was `self.is_connected and self.client is not None`
-        — a flag WE set at login, so it could never become false on its own. A
-        session the broker dropped or kicked (signing in from a browser or
-        another device de-authorises the socket) stayed "alive" forever, the
-        health monitor never reconnected, and orders went into a socket the
-        server ignores: no confirmation, no error, just a timeout.
+        This is an active round trip — reset the auth flag, re-send the token,
+        wait for the server's reply — because every passive check lies:
+        pyquotex's check_connect() just reads state.auth_status, a flag set once
+        at the first login and never cleared. With that flag alone the monitor
+        reported "Quotex OK" while the socket was being rejected (HTTP 403) on
+        138 consecutive reconnect attempts and no order could be placed.
         """
         if not (self.is_connected and self.client is not None):
             return False
+        api = getattr(self.client, "api", None)
+        if api is None or api.websocket is None:
+            self.is_connected = False
+            return False
         try:
-            alive = await asyncio.wait_for(self.client.check_connect(), timeout=10)
-        except Exception as e:
-            self.logger.warning(f"Quotex connection check failed: {e}")
-            alive = False
+            from pyquotex.global_value import AuthStatus
+            api.state.auth_status = AuthStatus.NOT_AUTHENTICATED
+        except Exception:
+            pass
+        alive = await self._ensure_authorized(timeout=8.0)
         if not alive:
+            self.logger.warning(
+                "Quotex socket is not authorized — flagging for a fresh login."
+            )
             self.is_connected = False      # let the health monitor reconnect
         return alive
 
-    def _time_mode(self) -> str:
-        """Order style: TIMER = fixed duration (optionType 100), TURBO = candle-aligned."""
+    def _time_mode(self, asset_name: str = "") -> str:
+        """
+        Order style. TIMER for every asset, as requested.
+
+        TIMER sends optionType 100 with a RELATIVE duration, so the trade runs
+        exactly its stated duration from the fill rather than to the next candle
+        boundary — which is what the signals describe.
+
+        There was previously an "AUTO" mode that sent TURBO on non-OTC pairs, on
+        the theory that Quotex rejects TIMER off OTC. That theory was WRONG: the
+        24h log shows OTC pairs (USDBDT_otc, NZDCAD_otc, CADCHF_otc, ...) failing
+        identically. The real cause was an unauthorized WebSocket, fixed in
+        _ensure_authorized(). Asset class never mattered.
+        """
         mode = str(getattr(self.config.quotex, "time_mode", "TIMER") or "TIMER").upper()
-        return mode if mode in ("TIMER", "TURBO", "TIME") else "TIMER"
+        return mode if mode in ("TIMER", "TIME") else "TIMER"
+
+    async def _retire_client(self):
+        """Shut down the current client so its reconnect loop cannot outlive it."""
+        client, self.client = self.client, None
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.close(), timeout=10)
+            self.logger.info("Previous Quotex client closed.")
+        except Exception as e:
+            self.logger.debug(f"Closing the previous Quotex client: {e}")
 
     async def disconnect(self):
         if self.client:
@@ -321,21 +460,33 @@ class QuotexHandler:
         the order was rejected — it may be live at the broker but untracked here.
         """
         bits = []
+        api = getattr(self.client, "api", None)
+
+        # Report the CURRENT socket, not pyquotex's sticky auth flag: that flag
+        # is set once at the first login and never cleared, so it happily read
+        # "authenticated" through 138 rejected reconnects.
+        sock_open = bool(api is not None and api.websocket is not None)
+        bits.append(f"ws_open={sock_open}")
         try:
-            authed = await asyncio.wait_for(self.client.check_connect(), timeout=5)
+            from pyquotex.global_value import AuthStatus
+            status = api.state.auth_status if api else None
+            bits.append(f"ws_auth={getattr(status, 'name', status)}")
+            authed = status == AuthStatus.AUTHENTICATED
         except Exception:
             authed = False
-        bits.append(f"ws_authenticated={authed}")
-        if not authed:
-            self.is_connected = False        # health monitor will reconnect
-            bits.append("session is dead — flagged for reconnect")
+            bits.append("ws_auth=unknown")
+
+        if not (sock_open and authed):
+            self.is_connected = False        # health monitor will re-login
+            bits.append("socket unusable — flagged for reconnect")
+
         try:
-            state = self.client.api.state
+            state = api.state
             if getattr(state, "check_websocket_if_error", False):
                 bits.append(f"ws_error={getattr(state, 'websocket_error_reason', '')!r}")
         except Exception:
             pass
-        bits.append(f"time_mode={self._time_mode()}")
+        bits.append(f"time_mode={self._time_mode(asset_name)}")
         bits.append("the order MAY still have reached Quotex — check the platform")
         return " | ".join(bits)
 
@@ -362,6 +513,15 @@ class QuotexHandler:
             self.logger.info(f"Order path pre-warmed in {time.monotonic() - t0:.2f}s")
         except Exception as e:
             self.logger.debug(f"Pre-warm skipped: {e}")
+
+        # Confirm the socket is still authorized while there is time to fix it.
+        # An idle socket gets recycled every ~60 s and comes back anonymous.
+        if not await self._ensure_authorized():
+            self.logger.warning(
+                "Quotex socket is NOT authorized while arming this signal — "
+                "the health monitor will re-login; the entry may be missed."
+            )
+            self.is_connected = False
 
         self.logger.info(
             f"Pre-configured: ${amount:.2f} | duration: {expiry or '00:01:00'} "
@@ -628,9 +788,11 @@ class QuotexHandler:
         not_after: wall-clock epoch after which this entry is stale and must NOT
         be sent (see _too_late_to_enter).
         """
+        mode = self._time_mode(asset_name)
         self.logger.info(
             f"Placing trade: {asset_name} {direction.upper()} "
-            f"${amount:.2f}  duration: {period_secs}s  (runs {period_secs}s from entry)"
+            f"${amount:.2f}  duration: {period_secs}s  mode: {mode} "
+            f"({'runs ' + str(period_secs) + 's from the fill' if mode == 'TIMER' else 'candle-aligned expiry'})"
         )
 
         # ── Orders MUST be sent one at a time ─────────────────────────────
@@ -647,6 +809,17 @@ class QuotexHandler:
             # freshness check happens HERE — the last moment before the order
             # goes out — not before the queue.
             if self._too_late_to_enter(not_after, asset_name, direction):
+                return False, None
+
+            # Final guarantee: the socket carrying this order is authorized.
+            # Without this an order can be sent into a socket the watchdog
+            # recycled seconds ago, which the server accepts and ignores.
+            if not await self._ensure_authorized(timeout=4.0):
+                self.logger.error(
+                    f"NOT sending {asset_name} {direction.upper()} — the WebSocket "
+                    f"is not authorized (the broker would silently drop it)."
+                )
+                self.is_connected = False
                 return False, None
 
             # Signals come from Telegram, not from price data, so the realtime
@@ -671,7 +844,7 @@ class QuotexHandler:
             try:
                 status, buy_info = await asyncio.wait_for(
                     self.client.buy(amount, asset_name, direction, period_secs,
-                                    time_mode=self._time_mode()),
+                                    time_mode=mode),
                     timeout=BUY_CONFIRM_TIMEOUT,
                 )
             except asyncio.TimeoutError:

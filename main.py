@@ -149,10 +149,15 @@ class TradingBot:
     # ── Health monitor ────────────────────────────────────────
 
     async def _health_monitor(self):
-        """Check Quotex every 60 s (not connected) or 3600 s (connected)."""
+        """
+        Check Quotex every 60 s. The connected case used to be checked hourly,
+        which was far too slow: an idle socket is recycled (and, before the fix,
+        left unauthenticated) every ~60 s, so a whole hour of signals could be
+        swallowed before anything noticed.
+        """
         self.logger.info("Health monitor started")
         while self.running:
-            interval = 3600 if self.quotex_handler.is_connected else 60
+            interval = 120 if self.quotex_handler.is_connected else 60
             await asyncio.sleep(interval)
             if not self.running:
                 break
@@ -283,6 +288,9 @@ class TradingBot:
             'asyncio',
             'pyasn1',
             'urllib3', 'charset_normalizer',
+            # httpx logs a line per request; the balance refresh polls
+            # /api/v1/cabinets/digest every 10s, which buried the real log.
+            'httpx', 'httpcore',
         ]
         for name in _silent_at_warning:
             logging.getLogger(name).setLevel(logging.WARNING)
