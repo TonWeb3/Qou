@@ -1,12 +1,13 @@
 {
   "quotex": {
-    "email": "ii@gmail.com",
+    "email": "iiii@gmail.com",
     "password": "iiii",
-    "early_entry_seconds": 1
+    "early_entry_seconds": 2,
+    "time_mode": "TIMER"
   },
   "telegram": {
     "api_id": 000000,
-    "api_hash": "0000",
+    "api_hash": "0000000",
     "session_name": "bot_session",
     "channels": [
       {
