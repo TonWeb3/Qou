@@ -22,7 +22,8 @@ _ASSETS_DIR  = BASE_DIR / "dashboard"               # HTML/CSS/JS live here
 # The ONE config location, shared with bot/config.py so the dashboard and the
 # bot can never read different files. Override with QUOTEX_CONFIG_PATH (or
 # DATA_DIR) to keep settings on a volume instead of inside the image.
-from bot.config import Config, DEFAULT_CONFIG_FILE as CONFIG_FILE
+from bot.config import (Config, load_json_file,
+                        DEFAULT_CONFIG_FILE as CONFIG_FILE)
 sys.path.insert(0, str(BASE_DIR))
 
 app = Flask(
@@ -159,10 +160,21 @@ def _read_json(path: Path, default=None):
     """
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8-sig"))
+            return load_json_file(path)
     except Exception as e:
         logging.getLogger(__name__).error(f"Could not read {path}: {e}")
     return default if default is not None else {}
+
+
+def _config_error() -> Optional[str]:
+    """The precise reason config.json cannot be read, or None if it is fine."""
+    try:
+        if not CONFIG_FILE.exists():
+            return f"{CONFIG_FILE} does not exist."
+        load_json_file(CONFIG_FILE)
+        return None
+    except Exception as e:
+        return str(e)
 
 
 def _normalize_phone(raw) -> str:
@@ -318,16 +330,33 @@ def get_settings():
 
     cfg = _read_json(CONFIG_FILE)
     if not cfg.get("trading"):
-        # Say so instead of returning {} and letting the form invent defaults.
-        resp = jsonify({
-            "error": f"{CONFIG_FILE} exists but is not valid JSON, so no "
-                     f"settings could be read. The form has NOT been filled in "
-                     f"and nothing has been overwritten — fix the file, or set "
-                     f"QUOTEX_CONFIG_PATH to a writable location."
-        })
-        resp.status_code = 500
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        # The file is missing sections or could not be parsed. Serve the
+        # EFFECTIVE settings (defaults overlaid with whatever did parse) so the
+        # form is always usable, and attach a warning explaining what happened.
+        # Never block the dashboard on a bad file.
+        effective = Config(str(CONFIG_FILE))
+        cfg = {
+            "quotex": {
+                "email": effective.quotex.email,
+                "password": effective.quotex.password,
+                "early_entry_seconds": effective.quotex.early_entry_seconds,
+                "late_entry_grace_seconds": effective.quotex.late_entry_grace_seconds,
+                "time_mode": effective.quotex.time_mode,
+            },
+            "telegram": {
+                "api_id": effective.telegram.api_id,
+                "api_hash": effective.telegram.api_hash,
+                "session_name": effective.telegram.session_name,
+                "channels": [{"enabled": c.enabled, "identifier": c.identifier}
+                             for c in effective.telegram.channels],
+            },
+            "trading": effective.trading.__dict__,
+            "logging": effective.logging.__dict__,
+        }
+        problem = _config_error()
+        if problem:
+            cfg["warning"] = (f"{problem} Showing default settings — saving "
+                              f"will replace the unreadable file.")
     resp = jsonify(cfg)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp

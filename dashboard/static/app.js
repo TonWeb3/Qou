@@ -572,16 +572,19 @@ async function disconnectQuotex() {
 // ── Settings ──────────────────────────────────────────────
 async function loadSettings() {
   const cfg = await api('GET', '/api/settings');
-  // A failed read must NOT populate the form. Filling it with fallbacks made
-  // the placeholders look like real settings, and saving then wrote those
-  // invented defaults over the user's actual config.json.
+  // The server always returns the EFFECTIVE settings (config.json overlaid on
+  // the defaults), so the form is populated even when the file is imperfect —
+  // and saving is how the user repairs it. Only a genuine transport failure,
+  // where the current settings are unknown, leaves the form blank.
   if (!cfg || cfg.success === false || !cfg.trading) {
     _settingsLoaded = false;
-    showToast('Could not read settings: ' + ((cfg && cfg.message) || 'no data') +
+    showToast('Could not reach the server for settings: ' +
+              ((cfg && cfg.message) || 'no response') +
               ' — fields left blank so nothing is overwritten.', 'error');
     return;
   }
   _settingsLoaded = true;
+  if (cfg.warning) showToast(cfg.warning, 'error');
   _loadedConfig = cfg;  // preserve hardcoded fields for save
 
   const t = cfg.telegram || {};

@@ -4,6 +4,7 @@ Configuration management for the Quotex Telegram Trading Bot
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 import logging
@@ -35,6 +36,70 @@ def resolve_config_path() -> Path:
 
 
 DEFAULT_CONFIG_FILE = resolve_config_path()
+
+
+class ConfigParseError(Exception):
+    """config.json exists but could not be parsed. Carries a precise reason."""
+
+
+def load_json_file(path) -> dict:
+    """
+    Read a JSON config written by a human or uploaded from another machine.
+
+    Handles what actually goes wrong in practice rather than assuming clean
+    UTF-8: a BOM, a UTF-16 file (PowerShell's `>` redirect writes one), and the
+    trailing commas left behind when lines are deleted by hand — e.g. removing
+    the email/password lines from the "quotex" block leaves `"password": "",`
+    dangling before `}`.
+
+    Raises ConfigParseError naming the line, column and the offending text, so
+    the failure can be fixed instead of guessed at.
+    """
+    path = Path(path)
+    raw = path.read_bytes()
+    if not raw.strip():
+        raise ConfigParseError(f"{path} is empty (0 bytes of content).")
+
+    text = None
+    for encoding in ("utf-8-sig", "utf-16", "utf-8", "latin-1"):
+        try:
+            candidate = raw.decode(encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        if candidate.lstrip().startswith(("{", "[")):
+            text = candidate
+            break
+    if text is None:
+        raise ConfigParseError(
+            f"{path} is not text this program can read — it is not UTF-8, "
+            f"UTF-8 with BOM, or UTF-16. Re-save it as UTF-8."
+        )
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as first_error:
+        # One repair attempt: trailing commas, the usual result of deleting
+        # lines by hand. Anything else is reported, never guessed at.
+        repaired = re.sub(r",(\s*[}\]])", r"\1", text)
+        if repaired != text:
+            try:
+                data = json.loads(repaired)
+                logging.getLogger(__name__).warning(
+                    f"{path} had a trailing comma (line {first_error.lineno}); "
+                    f"reading it anyway. Save from Settings to tidy the file."
+                )
+                return data
+            except json.JSONDecodeError:
+                pass
+
+        lines = text.splitlines()
+        offending = (lines[first_error.lineno - 1].strip()
+                     if 0 < first_error.lineno <= len(lines) else "")
+        raise ConfigParseError(
+            f"{path} is not valid JSON: {first_error.msg} at line "
+            f"{first_error.lineno}, column {first_error.colno}"
+            + (f' — the text there is: {offending!r}' if offending else "")
+        ) from first_error
 
 
 # ── Tolerant readers ────────────────────────────────────────────────────────
@@ -190,82 +255,106 @@ class Config:
         return self.load_error is None
 
     def _load_config(self):
+        """
+        Start from the code defaults, then overlay whatever config.json provides.
+
+        Only keys PRESENT in the file are applied, and each section is applied in
+        isolation: one bad field logs a warning and skips that section, but never
+        drops the other sections back to defaults. An unreadable file is a
+        warning, not a stoppage — the bot keeps running on the values it has.
+        """
+        self.quotex   = QuotexConfig()
+        self.telegram = TelegramConfig()
+        self.trading  = TradingConfig()
+        self.logging  = LoggingConfig()
+
+        if not os.path.exists(self.config_file):
+            self._create_default_config()
+            self.logger.warning(f"Created default config file: {self.config_file}")
+            return
+
         try:
-            if os.path.exists(self.config_file):
-                # utf-8-sig, not the Windows locale default: editors and
-                # PowerShell add a UTF-8 BOM, which makes a plain read fail and
-                # used to fall back to defaults without a word.
-                with open(self.config_file, 'r', encoding='utf-8-sig') as f:
-                    config_data = json.load(f)
-
-                quotex_data = config_data.get('quotex', {})
-                self.quotex = QuotexConfig(
-                    email=quotex_data.get('email', ''),
-                    password=quotex_data.get('password', ''),
-                    early_entry_seconds=float(quotex_data.get('early_entry_seconds', 0.5)),
-                    late_entry_grace_seconds=float(
-                        quotex_data.get('late_entry_grace_seconds', 5.0)
-                    ),
-                    time_mode=quotex_data.get('time_mode', 'TIMER'),
-                )
-
-                tg_data = config_data.get('telegram', {})
-                channels = [
-                    ChannelConfig(
-                        enabled=c.get('enabled', True),
-                        identifier=c.get('identifier', ''),
-                    )
-                    for c in tg_data.get('channels', [])
-                ]
-                self.telegram = TelegramConfig(
-                    api_id=tg_data.get('api_id'),
-                    api_hash=tg_data.get('api_hash', ''),
-                    session_name=tg_data.get('session_name', 'quotex_bot_session'),
-                    channels=channels,
-                )
-
-                # Coerced, because config.json is meant to be hand-editable:
-                # "2" typed as a string must size a $2 trade, not crash or be
-                # compared as text against a number.
-                tr_data = config_data.get('trading', {})
-                self.trading = TradingConfig(
-                    account_type=str(tr_data.get('account_type', 'demo')),
-                    risk_mode=str(tr_data.get('risk_mode', 'fixed')),
-                    risk_amount=_num(tr_data.get('risk_amount'), 1.0),
-                    max_daily_trades=_int(tr_data.get('max_daily_trades'), 10),
-                    max_daily_loss=_num(tr_data.get('max_daily_loss'), 50.0),
-                    max_daily_loss_enabled=_bool(
-                        tr_data.get('max_daily_loss_enabled'), True),
-                    max_concurrent_trades=_int(
-                        tr_data.get('max_concurrent_trades'), 1),
-                    martingale_enabled=_bool(
-                        tr_data.get('martingale_enabled'), False),
-                    martingale_multiplier=_num(
-                        tr_data.get('martingale_multiplier'), 2.0),
-                    martingale_steps=_int(tr_data.get('martingale_steps'), 2),
-                )
-
-                self.logging = LoggingConfig(**config_data.get('logging', {}))
-                self._stamp_seen = self._stamp()
-                self.logger.info(f"Configuration loaded from {self.config_file}")
-            else:
-                self._create_default_config()
-                self.logger.warning(f"Created default config file: {self.config_file}")
-
+            config_data = load_json_file(self.config_file)
         except Exception as e:
-            # Do NOT overwrite the file with defaults here. It would destroy the
-            # user's real settings and silently trade at $1 with martingale off.
+            # Keep the defaults already set above and leave the file alone.
             self.load_error = str(e)
-            self.logger.error(
-                f"Could not read {self.config_file}: {e}. "
-                f"The file has NOT been changed — fix it (it must be valid JSON) "
-                f"and restart. Refusing to run on default settings."
+            self.logger.warning(
+                f"Could not read {self.config_file}: {e}. Using defaults for "
+                f"this load; the file has NOT been changed."
             )
-            if not hasattr(self, "trading"):
-                self.quotex   = QuotexConfig()
-                self.telegram = TelegramConfig()
-                self.trading  = TradingConfig()
-                self.logging  = LoggingConfig()
+            return
+
+        def _section(name, fn):
+            try:
+                fn()
+            except Exception as e:
+                self.logger.warning(f"config.json section '{name}' skipped ({e})")
+
+        def _quotex():
+            q = config_data["quotex"]
+            if "email" in q:    self.quotex.email    = q["email"] or ""
+            if "password" in q: self.quotex.password = q["password"] or ""
+            if "early_entry_seconds" in q:
+                self.quotex.early_entry_seconds = _num(q["early_entry_seconds"], 0.5)
+            if "late_entry_grace_seconds" in q:
+                self.quotex.late_entry_grace_seconds = _num(
+                    q["late_entry_grace_seconds"], 5.0)
+            if "time_mode" in q and q["time_mode"]:
+                self.quotex.time_mode = str(q["time_mode"])
+        if "quotex" in config_data: _section("quotex", _quotex)
+
+        def _telegram():
+            t = config_data["telegram"]
+            if "api_id" in t:       self.telegram.api_id       = t["api_id"]
+            if "api_hash" in t:     self.telegram.api_hash     = t["api_hash"] or ""
+            if "session_name" in t and t["session_name"]:
+                self.telegram.session_name = t["session_name"]
+            if "channels" in t:
+                self.telegram.channels = [
+                    ChannelConfig(enabled=c.get("enabled", True),
+                                  identifier=c.get("identifier", ""))
+                    for c in (t["channels"] or [])
+                ]
+        if "telegram" in config_data: _section("telegram", _telegram)
+
+        def _trading():
+            # Coerced, because config.json is meant to be hand-editable: "2"
+            # typed as a string must size a $2 trade.
+            tr = config_data["trading"]
+            if "account_type" in tr: self.trading.account_type = str(tr["account_type"])
+            if "risk_mode" in tr:    self.trading.risk_mode    = str(tr["risk_mode"])
+            if "risk_amount" in tr:
+                self.trading.risk_amount = _num(tr["risk_amount"], 1.0)
+            if "max_daily_trades" in tr:
+                self.trading.max_daily_trades = _int(tr["max_daily_trades"], 10)
+            if "max_daily_loss" in tr:
+                self.trading.max_daily_loss = _num(tr["max_daily_loss"], 50.0)
+            if "max_daily_loss_enabled" in tr:
+                self.trading.max_daily_loss_enabled = _bool(
+                    tr["max_daily_loss_enabled"], True)
+            if "max_concurrent_trades" in tr:
+                self.trading.max_concurrent_trades = _int(
+                    tr["max_concurrent_trades"], 1)
+            if "martingale_enabled" in tr:
+                self.trading.martingale_enabled = _bool(
+                    tr["martingale_enabled"], False)
+            if "martingale_multiplier" in tr:
+                self.trading.martingale_multiplier = _num(
+                    tr["martingale_multiplier"], 2.0)
+            if "martingale_steps" in tr:
+                self.trading.martingale_steps = _int(tr["martingale_steps"], 2)
+        if "trading" in config_data: _section("trading", _trading)
+
+        def _logging():
+            lo = config_data["logging"]
+            if "log_level" in lo and lo["log_level"]:
+                self.logging.log_level = str(lo["log_level"])
+            if "log_file" in lo and lo["log_file"]:
+                self.logging.log_file = str(lo["log_file"])
+        if "logging" in config_data: _section("logging", _logging)
+
+        self._stamp_seen = self._stamp()
+        self.logger.info(f"Configuration loaded from {self.config_file}")
 
     def _create_default_config(self):
         """Only ever called when no config file exists at all."""

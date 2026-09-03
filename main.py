@@ -68,11 +68,11 @@ class TradingBot:
             self.logger.info("=== Quotex Telegram Trading Bot Starting ===")
 
             if self.config.load_error:
-                # Better to not start than to trade at default size.
+                # A bad file does not stop the bot — it runs on the defaults
+                # logged below, exactly as the settings line reports.
                 self.alert = (f"config.json could not be read "
-                              f"({self.config.load_error}) — settings not applied.")
-                self.logger.error(self.alert)
-                return False
+                              f"({self.config.load_error}) — running on defaults.")
+                self.logger.warning(self.alert)
 
             t = self.config.trading
             self.logger.info(
