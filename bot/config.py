@@ -5,8 +5,16 @@ Configuration management for the Quotex Telegram Trading Bot
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 import logging
 from typing import Optional, Union, List
+
+# config.json lives beside main.py. Resolving it against the CWD instead meant
+# that launching the bot from anywhere else found no file, silently fell back to
+# DEFAULTS (risk_amount 1.0, max_daily_trades 10, martingale off) and wrote a
+# stray config.json into whatever directory it was started from.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_FILE = PROJECT_ROOT / "config.json"
 
 
 @dataclass
@@ -65,10 +73,27 @@ class LoggingConfig:
 class Config:
     """Main configuration class"""
 
-    def __init__(self, config_file: str = "config.json"):
-        self.config_file = config_file
+    def __init__(self, config_file: Optional[str] = None):
+        # A bare name is resolved against the project root, so the values the
+        # user set in Settings are used no matter where the bot was launched.
+        path = Path(config_file) if config_file else DEFAULT_CONFIG_FILE
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        self.config_file = str(path)
         self.logger = logging.getLogger(__name__)
+        self.load_error: Optional[str] = None
         self._load_config()
+
+    def reload(self) -> bool:
+        """
+        Re-read config.json in place.
+
+        Every component shares this one object, so mutating it makes a Settings
+        change take effect on the RUNNING bot instead of waiting for a restart.
+        """
+        self.load_error = None
+        self._load_config()
+        return self.load_error is None
 
     def _load_config(self):
         try:
@@ -123,8 +148,19 @@ class Config:
                 self.logger.warning(f"Created default config file: {self.config_file}")
 
         except Exception as e:
-            self.logger.error(f"Error loading configuration: {e}")
-            self._create_default_config()
+            # Do NOT overwrite the file with defaults here. It would destroy the
+            # user's real settings and silently trade at $1 with martingale off.
+            self.load_error = str(e)
+            self.logger.error(
+                f"Could not read {self.config_file}: {e}. "
+                f"The file has NOT been changed — fix it (it must be valid JSON) "
+                f"and restart. Refusing to run on default settings."
+            )
+            if not hasattr(self, "trading"):
+                self.quotex   = QuotexConfig()
+                self.telegram = TelegramConfig()
+                self.trading  = TradingConfig()
+                self.logging  = LoggingConfig()
 
     def _create_default_config(self):
         self.quotex  = QuotexConfig()

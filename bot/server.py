@@ -2,6 +2,7 @@
 QUOTEX1 Dashboard — Flask + SocketIO backend
 """
 
+import logging
 import asyncio
 import json
 import sys
@@ -300,7 +301,28 @@ def save_settings():
         existing = _read_json(BASE_DIR / "config.json", {})
         merged = _deep_merge(existing, data)
         (BASE_DIR / "config.json").write_text(json.dumps(merged, indent=2))
-        return jsonify({"success": True})
+
+        # Push the new values into whatever is already running. Every component
+        # shares one Config object, so reloading it in place means a Settings
+        # change applies immediately instead of being ignored until a restart.
+        applied = []
+        for holder in (_bot_instance, _shared_quotex):
+            cfg = getattr(holder, "config", None)
+            if cfg is not None and cfg not in applied:
+                try:
+                    cfg.reload()
+                    applied.append(cfg)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        f"Could not apply settings to the running bot: {e}")
+        if applied:
+            t = applied[0].trading
+            logging.getLogger(__name__).info(
+                f"Settings applied live — risk_mode={t.risk_mode} "
+                f"risk_amount={t.risk_amount:g} max_daily_trades={t.max_daily_trades} "
+                f"martingale={'on' if t.martingale_enabled else 'off'}"
+            )
+        return jsonify({"success": True, "applied_live": bool(applied)})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 

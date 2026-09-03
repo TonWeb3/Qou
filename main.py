@@ -52,14 +52,37 @@ class TradingBot:
 
     async def start(self) -> bool:
         try:
-            if not os.path.exists('config.json'):
-                print("config.json not found — open Settings to configure.")
+            from bot.config import DEFAULT_CONFIG_FILE
+            if not DEFAULT_CONFIG_FILE.exists():
+                print(f"{DEFAULT_CONFIG_FILE} not found — open Settings to configure.")
                 return False
 
+            # No argument: Config resolves against the project root, so the bot
+            # uses the settings the user actually saved no matter which
+            # directory it was launched from.
             self.config = Config()
             self._setup_logging()
             self.logger = logging.getLogger(__name__)
             self.logger.info("=== Quotex Telegram Trading Bot Starting ===")
+
+            if self.config.load_error:
+                # Better to not start than to trade at default size.
+                self.alert = (f"config.json could not be read "
+                              f"({self.config.load_error}) — settings not applied.")
+                self.logger.error(self.alert)
+                return False
+
+            t = self.config.trading
+            self.logger.info(
+                "Settings in use — risk: %s %s | max trades/day: %s | "
+                "max concurrent: %s | martingale: %s | account: %s",
+                t.risk_mode,
+                f"${t.risk_amount:g}" if t.risk_mode == "fixed" else f"{t.risk_amount:g}%",
+                t.max_daily_trades, t.max_concurrent_trades,
+                f"on x{t.martingale_multiplier:g} ({t.martingale_steps} steps)"
+                if t.martingale_enabled else "off",
+                t.account_type,
+            )
 
             if not self.config.validate():
                 self.logger.error("Configuration validation failed.")

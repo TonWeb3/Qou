@@ -158,6 +158,7 @@ class QuotexHandler:
             # Every later socket (the watchdog recycles an idle one every 60 s)
             # must re-authorize itself, or orders go into an anonymous socket.
             self._install_reauth_hook()
+            self._start_keepalive()
 
             balance = await self.client.get_balance()
             self.logger.info(f"Connected. Balance: ${balance:.2f}")
@@ -239,10 +240,48 @@ class QuotexHandler:
                     )
             except Exception as e:
                 handler.logger.error(f"Could not re-authorize the new WebSocket: {e}")
+            handler._start_keepalive()
 
         api._on_open = _on_open_with_reauth
         api._qx1_reauth_installed = True
         self.logger.info("Re-authorization hook installed on the Quotex WebSocket.")
+
+    # pyquotex's own heartbeat sends 42["tick"] every 5 s, which the server
+    # NEVER answers (measured: 0 replies in 6 s, likewise instruments/get and
+    # chart_notification/get). Only the socket.io protocol ping "2" gets a "3"
+    # pong back. Since the watchdog measures INBOUND silence, an unanswered
+    # heartbeat is worthless: a bot waiting for signals subscribes to nothing,
+    # inbound bursts arrive 40+ s apart, and the socket is torn down and rebuilt
+    # every minute forever. One "2" every 20 s (the server's own pingInterval is
+    # 25 s) keeps it genuinely alive and stops the churn.
+    KEEPALIVE_SECONDS = 20
+
+    def _start_keepalive(self):
+        """Keep the socket demonstrably alive so the watchdog stops recycling it."""
+        task = getattr(self, "_keepalive_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+
+        api = getattr(self.client, "api", None)
+        if api is None:
+            return
+
+        async def _ping_loop():
+            socket = api.websocket          # this socket only; a new one re-arms
+            try:
+                while socket is not None and api.websocket is socket:
+                    await asyncio.sleep(self.KEEPALIVE_SECONDS)
+                    if api.websocket is not socket:
+                        return
+                    try:
+                        await socket.send("2")
+                    except Exception as e:
+                        self.logger.debug(f"Keepalive ping stopped: {e}")
+                        return
+            except asyncio.CancelledError:
+                pass
+
+        self._keepalive_task = asyncio.ensure_future(_ping_loop())
 
     async def _ensure_authorized(self, timeout: float = 6.0) -> bool:
         """
@@ -326,6 +365,11 @@ class QuotexHandler:
 
     async def _retire_client(self):
         """Shut down the current client so its reconnect loop cannot outlive it."""
+        task = getattr(self, "_keepalive_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._keepalive_task = None
+
         client, self.client = self.client, None
         if client is None:
             return
@@ -336,6 +380,10 @@ class QuotexHandler:
             self.logger.debug(f"Closing the previous Quotex client: {e}")
 
     async def disconnect(self):
+        task = getattr(self, "_keepalive_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._keepalive_task = None
         if self.client:
             try:
                 await self.client.close()
