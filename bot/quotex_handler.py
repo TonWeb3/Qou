@@ -586,7 +586,11 @@ class QuotexHandler:
         Calculate the BASE trade amount: percent of balance, or fixed dollars.
         Martingale step sizing (doubling) is handled by the recovery loop in
         perform_trade(), not here — this always returns the step-1 base.
+
+        Re-reads config.json first if it changed, so the stake is always the one
+        the file currently specifies.
         """
+        self.config.refresh_if_changed()
         if self.config.trading.risk_mode == "percent":
             try:
                 balance = await self.client.get_balance()
@@ -974,6 +978,11 @@ class QuotexHandler:
         # Cheap early exit before the gates spend time on balance/asset checks.
         if self._too_late_to_enter(not_after, self._format_asset(symbol), direction):
             return False
+
+        # config.json is the source of truth: pick up any edit made since the
+        # last trade (Settings screen, hand edit, or a replaced file on a
+        # volume) so THIS trade is gated and sized by what the file says now.
+        self.config.refresh_if_changed()
 
         # Refresh realized daily P&L / drawdown from the live balance before gating.
         await self._refresh_balance_stats()

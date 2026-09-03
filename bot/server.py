@@ -5,6 +5,7 @@ QUOTEX1 Dashboard — Flask + SocketIO backend
 import logging
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -17,6 +18,11 @@ from flask_socketio import SocketIO, emit
 
 BASE_DIR     = Path(__file__).parent.parent          # QUOTEX1 root
 _ASSETS_DIR  = BASE_DIR / "dashboard"               # HTML/CSS/JS live here
+
+# The ONE config location, shared with bot/config.py so the dashboard and the
+# bot can never read different files. Override with QUOTEX_CONFIG_PATH (or
+# DATA_DIR) to keep settings on a volume instead of inside the image.
+from bot.config import Config, DEFAULT_CONFIG_FILE as CONFIG_FILE
 sys.path.insert(0, str(BASE_DIR))
 
 app = Flask(
@@ -231,7 +237,7 @@ def get_bot_state() -> dict:
     so the dashboard keeps showing the balance with the bot stopped.
     """
     bot = _bot_instance
-    cfg = _read_json(BASE_DIR / "config.json")
+    cfg = _read_json(CONFIG_FILE)
     trading = cfg.get("trading", {})
 
     qh      = (bot.quotex_handler if bot is not None else None) or _shared_quotex
@@ -253,6 +259,11 @@ def get_bot_state() -> dict:
         "max_daily_trades":       trading.get("max_daily_trades", 0),
         "max_daily_loss":         trading.get("max_daily_loss", 0),
         "max_daily_loss_enabled": trading.get("max_daily_loss_enabled", True),
+        # Whether the deployment supplies Quotex credentials via the
+        # environment, so config.json can be uploaded without them. A boolean
+        # only — never the values themselves.
+        "quotex_env_credentials": bool(os.getenv("QUOTEX_EMAIL")
+                                       and os.getenv("QUOTEX_PASSWORD")),
         "active_trades":          qh.active_trades if qh else 0,
         "max_concurrent_trades":  trading.get("max_concurrent_trades", 1),
         "last_trade":      qh.last_trade if qh else None,
@@ -266,7 +277,7 @@ def get_bot_state() -> dict:
 
 def get_connection_status() -> dict:
     """Return live connection status — reads directly from bot instance when running."""
-    config = _read_json(BASE_DIR / "config.json")
+    config = _read_json(CONFIG_FILE)
     session_name = (config.get("telegram", {}).get("session_name") or "quotex_bot_session")
     session_data = _read_json(BASE_DIR / f"{session_name}.json")
     telegram_ok  = bool(session_data.get("session_string"))
@@ -292,12 +303,27 @@ def api_status():
 def get_settings():
     # no-store so the dashboard always reflects the live config.json and never a
     # cached copy — otherwise edits made directly on disk wouldn't show up.
-    cfg = _read_json(BASE_DIR / "config.json")
+    if not CONFIG_FILE.exists():
+        # A fresh deployment (or a volume mounted over the image) has no config
+        # yet. Create one from the defaults so Settings is usable and the user
+        # can fill it in — this is NOT the same as overwriting a file that
+        # exists but cannot be parsed, which stays forbidden.
+        logging.getLogger(__name__).warning(
+            f"No config file at {CONFIG_FILE} — creating one from defaults."
+        )
+        try:
+            Config(str(CONFIG_FILE))
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Could not create {CONFIG_FILE}: {e}")
+
+    cfg = _read_json(CONFIG_FILE)
     if not cfg.get("trading"):
         # Say so instead of returning {} and letting the form invent defaults.
         resp = jsonify({
-            "error": f"config.json could not be read from {BASE_DIR}. "
-                     f"It must be valid JSON — the form has NOT been filled in."
+            "error": f"{CONFIG_FILE} exists but is not valid JSON, so no "
+                     f"settings could be read. The form has NOT been filled in "
+                     f"and nothing has been overwritten — fix the file, or set "
+                     f"QUOTEX_CONFIG_PATH to a writable location."
         })
         resp.status_code = 500
         resp.headers["Cache-Control"] = "no-store"
@@ -314,9 +340,11 @@ def save_settings():
         # Merge over the existing file so fields the dashboard doesn't send are
         # preserved exactly (e.g. session_name). Whatever the form does send
         # overwrites the matching keys — so frontend edits land in config.json.
-        existing = _read_json(BASE_DIR / "config.json", {})
+        existing = _read_json(CONFIG_FILE, {})
         merged = _deep_merge(existing, data)
-        (BASE_DIR / "config.json").write_text(json.dumps(merged, indent=2))
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(merged, indent=2),
+                               encoding="utf-8")
 
         # Push the new values into whatever is already running. Every component
         # shares one Config object, so reloading it in place means a Settings
@@ -428,7 +456,7 @@ def _patch_state(patch: dict):
 
 def _log_path() -> Path:
     """The log file the bot is actually writing to (honours logging.log_file)."""
-    cfg  = _read_json(BASE_DIR / "config.json")
+    cfg  = _read_json(CONFIG_FILE)
     name = (cfg.get("logging", {}) or {}).get("log_file") or "quotex_bot.log"
     return BASE_DIR / "logs" / name
 
@@ -555,7 +583,7 @@ def telegram_connect():
                        "(e.g. 12342342345 for the US).",
         }), 400
 
-    config = _read_json(BASE_DIR / "config.json")
+    config = _read_json(CONFIG_FILE)
     api_id   = config.get("telegram", {}).get("api_id")
     api_hash = config.get("telegram", {}).get("api_hash", "")
 
@@ -587,7 +615,7 @@ def telegram_connect():
 def _save_tg_session(client, phone):
     """Persist the authorized Telethon StringSession, then release the client."""
     session_str  = client.session.save()
-    config       = _read_json(BASE_DIR / "config.json")
+    config       = _read_json(CONFIG_FILE)
     session_name = config.get("telegram", {}).get("session_name", "quotex_bot_session")
     (BASE_DIR / f"{session_name}.json").write_text(json.dumps({
         "session_string": session_str,
@@ -662,7 +690,7 @@ def telegram_password():
 
 @app.route("/api/telegram/disconnect", methods=["POST"])
 def telegram_disconnect():
-    config       = _read_json(BASE_DIR / "config.json")
+    config       = _read_json(CONFIG_FILE)
     session_name = config.get("telegram", {}).get("session_name", "quotex_bot_session")
     session_file = BASE_DIR / f"{session_name}.json"
     if session_file.exists():
@@ -684,17 +712,34 @@ def quotex_connect():
     email    = (data.get("email")    or "").strip()
     password = (data.get("password") or "").strip()
 
+    # Credentials may live in the environment instead of the file — the
+    # supported way to deploy without putting them in config.json at all.
+    # Blank form fields mean "use the environment", not "no credentials".
+    from_env = False
     if not email or not password:
-        return jsonify({"success": False, "message": "Email and password are required."}), 400
+        email    = email    or os.getenv("QUOTEX_EMAIL", "")
+        password = password or os.getenv("QUOTEX_PASSWORD", "")
+        from_env = True
 
-    # Persist credentials to config.json immediately so the bot can read them
-    cfg = _read_json(BASE_DIR / "config.json")
-    cfg.setdefault("quotex", {})["email"]    = email
-    cfg.setdefault("quotex", {})["password"] = password
-    try:
-        (BASE_DIR / "config.json").write_text(json.dumps(cfg, indent=2))
-    except Exception as e:
-        return jsonify({"success": False, "message": f"Could not save config: {e}"}), 500
+    if not email or not password:
+        return jsonify({"success": False, "message":
+                        "Email and password are required — enter them here, or "
+                        "set QUOTEX_EMAIL and QUOTEX_PASSWORD in the "
+                        "environment."}), 400
+
+    if not from_env:
+        # Only write credentials the user actually typed. Copying environment
+        # values into config.json would defeat the point of keeping them out
+        # of the file.
+        cfg = _read_json(CONFIG_FILE)
+        cfg.setdefault("quotex", {})["email"]    = email
+        cfg.setdefault("quotex", {})["password"] = password
+        try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        except Exception as e:
+            return jsonify({"success": False,
+                            "message": f"Could not save config: {e}"}), 500
 
     async def _connect() -> tuple:
         """Open (or keep) the shared Quotex session on the shared loop."""
@@ -705,13 +750,19 @@ def quotex_connect():
         # Already live on these credentials? Reuse it — no second login, no PIN.
         existing = _shared_quotex
         if existing is not None and existing.is_connected:
-            if (existing.config.quotex.email == email
-                    and existing.config.quotex.password == password):
+            # Compare RESOLVED credentials: with env-based auth the config
+            # fields are blank, so comparing them directly would never match
+            # and every Connect click would tear down a working session.
+            live_email = (os.getenv("QUOTEX_EMAIL")
+                          or existing.config.quotex.email)
+            live_pass  = (os.getenv("QUOTEX_PASSWORD")
+                          or existing.config.quotex.password)
+            if live_email == email and live_pass == password:
                 return True, "Already connected — reusing the live session."
             await existing.disconnect()      # credentials changed: replace it
             _shared_quotex = None
 
-        handler = QuotexHandler(Config(str(BASE_DIR / "config.json")))
+        handler = QuotexHandler(Config(str(CONFIG_FILE)))
         if await handler.connect(otp_callback=_make_otp_callback()):
             _shared_quotex = handler         # KEEP it alive for the bot to adopt
             return True, ""
@@ -763,11 +814,12 @@ def quotex_disconnect():
             pass
         _shared_quotex = None
 
-    cfg = _read_json(BASE_DIR / "config.json")
+    cfg = _read_json(CONFIG_FILE)
     cfg.setdefault("quotex", {})["email"]    = ""
     cfg.setdefault("quotex", {})["password"] = ""
     try:
-        (BASE_DIR / "config.json").write_text(json.dumps(cfg, indent=2))
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     except Exception:
         pass
     _patch_state({"quotex_connected": False})

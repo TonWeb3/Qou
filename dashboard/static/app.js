@@ -14,6 +14,9 @@ let _loadedConfig = {};
 // False until /api/settings has been read successfully. Guards against
 // saving a form that was never filled in from disk.
 let _settingsLoaded = false;
+// True when the server has QUOTEX_EMAIL/QUOTEX_PASSWORD set, in which case the
+// Connect form may be left blank and the environment is used instead.
+let _envCredentials = false;
 
 // ── DOM helpers ──────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -117,6 +120,12 @@ function setBar(id, pct) {
 
 // ── Metrics ───────────────────────────────────────────────
 function updateMetrics(s) {
+  // Remember whether the server holds Quotex credentials in its environment,
+  // so config.json can be deployed without them and the Connect form can
+  // accept blank fields instead of demanding a retype.
+  if (typeof s.quotex_env_credentials === 'boolean') {
+    _envCredentials = s.quotex_env_credentials;
+  }
   const isPct = s.risk_mode === 'percent';
 
   // Balance + account type
@@ -477,8 +486,12 @@ $('btn-qx-connect')?.addEventListener('click', () => {
 $('btn-qx-save')?.addEventListener('click', async () => {
   const email    = $('qx-email').value.trim();
   const password = $('qx-password').value;
-  if (!email)    { showFieldError('qx-email',    'Enter your Quotex email');    return; }
-  if (!password) { showFieldError('qx-password', 'Enter your Quotex password'); return; }
+  // Blank is legitimate when the server holds the credentials in its
+  // environment — that is how config.json is deployed without them.
+  if (!_envCredentials) {
+    if (!email)    { showFieldError('qx-email',    'Enter your Quotex email');    return; }
+    if (!password) { showFieldError('qx-password', 'Enter your Quotex password'); return; }
+  }
 
   showQxStep('qx-step-testing');
 
@@ -538,6 +551,11 @@ function _onQxConnected(email, password) {
   showQxStep('qx-step-success');
   state.connections.quotex = true;
   updateConnectionBadges(state.connections);
+  if (!email && !password) {
+    // Connected using the server's environment credentials — there is nothing
+    // to mirror into the Settings fields, and blanking them would be wrong.
+    return;
+  }
   setValue('s-qx-email',    email);
   setValue('s-qx-password', password);
   _loadedConfig.quotex = { ...(_loadedConfig.quotex || {}), email, password };

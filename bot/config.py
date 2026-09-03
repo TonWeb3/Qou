@@ -14,7 +14,58 @@ from typing import Optional, Union, List
 # DEFAULTS (risk_amount 1.0, max_daily_trades 10, martingale off) and wrote a
 # stray config.json into whatever directory it was started from.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_FILE = PROJECT_ROOT / "config.json"
+
+
+def resolve_config_path() -> Path:
+    """
+    Where config.json lives.
+
+    In a container the code directory (/app) is rebuilt on every deploy, so a
+    config.json written there is lost — and if the file never made it into the
+    image, the dashboard has nothing to read. Point QUOTEX_CONFIG_PATH at a file
+    (or DATA_DIR at a mounted volume) to keep settings outside the image.
+    """
+    explicit = os.getenv("QUOTEX_CONFIG_PATH") or os.getenv("CONFIG_PATH")
+    if explicit:
+        return Path(explicit).expanduser()
+    data_dir = os.getenv("DATA_DIR")
+    if data_dir:
+        return Path(data_dir).expanduser() / "config.json"
+    return PROJECT_ROOT / "config.json"
+
+
+DEFAULT_CONFIG_FILE = resolve_config_path()
+
+
+# ── Tolerant readers ────────────────────────────────────────────────────────
+# config.json is edited by hand, so a value may arrive as a string ("2"), and a
+# blank or nonsense entry must fall back to the documented default rather than
+# crashing the load and taking every other setting down with it.
+
+def _num(value, default: float) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(value, default: int) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool(value, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 @dataclass
@@ -82,7 +133,50 @@ class Config:
         self.config_file = str(path)
         self.logger = logging.getLogger(__name__)
         self.load_error: Optional[str] = None
+        self._stamp_seen = None      # file fingerprint at the last successful read
         self._load_config()
+
+    def _stamp(self):
+        """Fingerprint the file so an external edit can be detected cheaply."""
+        try:
+            st = os.stat(self.config_file)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def refresh_if_changed(self) -> bool:
+        """
+        config.json is the single source of truth.
+
+        If the file has changed since it was last read — edited by hand,
+        replaced on a volume, written by the Settings screen — re-read it here
+        so the very next decision uses the new values. Costs one os.stat() when
+        nothing has changed, which is the normal case.
+
+        Returns True if the file was re-read.
+        """
+        stamp = self._stamp()
+        if stamp is None or stamp == self._stamp_seen:
+            return False
+
+        fields = ("risk_mode", "risk_amount", "max_daily_trades",
+                  "max_daily_loss", "max_daily_loss_enabled",
+                  "max_concurrent_trades", "martingale_enabled",
+                  "martingale_multiplier", "martingale_steps", "account_type")
+        before = {f: getattr(self.trading, f) for f in fields}
+
+        if not self.reload():
+            # Unreadable now: keep running on the values already in use rather
+            # than dropping to defaults mid-session.
+            return False
+
+        changes = ", ".join(
+            f"{f}: {before[f]} -> {getattr(self.trading, f)}"
+            for f in fields if before[f] != getattr(self.trading, f)
+        )
+        if changes:
+            self.logger.info(f"config.json changed — now using {changes}")
+        return True
 
     def reload(self) -> bool:
         """
@@ -130,21 +224,29 @@ class Config:
                     channels=channels,
                 )
 
+                # Coerced, because config.json is meant to be hand-editable:
+                # "2" typed as a string must size a $2 trade, not crash or be
+                # compared as text against a number.
                 tr_data = config_data.get('trading', {})
                 self.trading = TradingConfig(
-                    account_type=tr_data.get('account_type', 'demo'),
-                    risk_mode=tr_data.get('risk_mode', 'fixed'),
-                    risk_amount=tr_data.get('risk_amount', 1.0),
-                    max_daily_trades=tr_data.get('max_daily_trades', 10),
-                    max_daily_loss=tr_data.get('max_daily_loss', 50.0),
-                    max_daily_loss_enabled=tr_data.get('max_daily_loss_enabled', True),
-                    max_concurrent_trades=tr_data.get('max_concurrent_trades', 1),
-                    martingale_enabled=tr_data.get('martingale_enabled', False),
-                    martingale_multiplier=tr_data.get('martingale_multiplier', 2.0),
-                    martingale_steps=tr_data.get('martingale_steps', 2),
+                    account_type=str(tr_data.get('account_type', 'demo')),
+                    risk_mode=str(tr_data.get('risk_mode', 'fixed')),
+                    risk_amount=_num(tr_data.get('risk_amount'), 1.0),
+                    max_daily_trades=_int(tr_data.get('max_daily_trades'), 10),
+                    max_daily_loss=_num(tr_data.get('max_daily_loss'), 50.0),
+                    max_daily_loss_enabled=_bool(
+                        tr_data.get('max_daily_loss_enabled'), True),
+                    max_concurrent_trades=_int(
+                        tr_data.get('max_concurrent_trades'), 1),
+                    martingale_enabled=_bool(
+                        tr_data.get('martingale_enabled'), False),
+                    martingale_multiplier=_num(
+                        tr_data.get('martingale_multiplier'), 2.0),
+                    martingale_steps=_int(tr_data.get('martingale_steps'), 2),
                 )
 
                 self.logging = LoggingConfig(**config_data.get('logging', {}))
+                self._stamp_seen = self._stamp()
                 self.logger.info(f"Configuration loaded from {self.config_file}")
             else:
                 self._create_default_config()
@@ -166,6 +268,7 @@ class Config:
                 self.logging  = LoggingConfig()
 
     def _create_default_config(self):
+        """Only ever called when no config file exists at all."""
         self.quotex  = QuotexConfig()
         self.telegram = TelegramConfig()
         self.trading  = TradingConfig()
@@ -208,6 +311,7 @@ class Config:
                 },
                 'logging': self.logging.__dict__,
             }
+            Path(self.config_file).parent.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_data, f, indent=2)
             self.logger.info(f"Configuration saved to {self.config_file}")

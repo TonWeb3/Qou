@@ -54,7 +54,9 @@ class TradingBot:
         try:
             from bot.config import DEFAULT_CONFIG_FILE
             if not DEFAULT_CONFIG_FILE.exists():
-                print(f"{DEFAULT_CONFIG_FILE} not found — open Settings to configure.")
+                print(f"{DEFAULT_CONFIG_FILE} not found — open Settings to "
+                      f"configure it, or set QUOTEX_CONFIG_PATH to point at an "
+                      f"existing config file.")
                 return False
 
             # No argument: Config resolves against the project root, so the bot
@@ -224,6 +226,10 @@ class TradingBot:
             if not self.running:
                 break
             try:
+                # config.json is the source of truth — notice an edit within
+                # ~10s so the dashboard and the log reflect it even while idle.
+                # (Each trade re-checks too, so a change is never missed.)
+                self.config.refresh_if_changed()
                 if self.quotex_handler.is_connected:
                     await self.quotex_handler._refresh_balance_stats(authoritative=True)
             except Exception as e:
