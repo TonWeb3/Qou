@@ -11,6 +11,9 @@ let state = {
 
 // Holds full loaded config so hardcoded fields are preserved on save
 let _loadedConfig = {};
+// False until /api/settings has been read successfully. Guards against
+// saving a form that was never filled in from disk.
+let _settingsLoaded = false;
 
 // ── DOM helpers ──────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -551,7 +554,16 @@ async function disconnectQuotex() {
 // ── Settings ──────────────────────────────────────────────
 async function loadSettings() {
   const cfg = await api('GET', '/api/settings');
-  if (!cfg) return;
+  // A failed read must NOT populate the form. Filling it with fallbacks made
+  // the placeholders look like real settings, and saving then wrote those
+  // invented defaults over the user's actual config.json.
+  if (!cfg || cfg.success === false || !cfg.trading) {
+    _settingsLoaded = false;
+    showToast('Could not read settings: ' + ((cfg && cfg.message) || 'no data') +
+              ' — fields left blank so nothing is overwritten.', 'error');
+    return;
+  }
+  _settingsLoaded = true;
   _loadedConfig = cfg;  // preserve hardcoded fields for save
 
   const t = cfg.telegram || {};
@@ -666,6 +678,13 @@ function applyRiskModeUnits(mode) {
 }
 
 async function saveSettings() {
+  if (!_settingsLoaded) {
+    // Otherwise this would write the form's fallback values (risk 1, 10 trades,
+    // martingale off) straight over the real configuration.
+    showToast('Settings were never loaded — refusing to save and overwrite ' +
+              'config.json. Reload the page first.', 'error');
+    return;
+  }
   const btn = $('btn-save');
   btn.classList.add('btn-saving');
   btn.textContent = 'Saving...';
@@ -748,7 +767,14 @@ async function api(method, url, body) {
     const opts = { method, headers: { 'Content-Type': 'application/json' }, cache: 'no-store' };
     if (body) opts.body = JSON.stringify(body);
     const res = await fetch(url, opts);
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Without this an error body looked like a config object, and every
+      // "?? default" below quietly filled the form with invented values.
+      return { success: false, _httpError: res.status,
+               message: data.error || data.message || ('HTTP ' + res.status) };
+    }
+    return data;
   } catch (e) {
     return { success: false, message: e.message };
   }

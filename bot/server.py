@@ -145,11 +145,17 @@ def _make_otp_callback():
 # ─── Helpers ─────────────────────────────────────────────────
 
 def _read_json(path: Path, default=None):
+    """
+    Read a JSON file. Tolerates a UTF-8 BOM (Windows editors and PowerShell add
+    one). A malformed file is LOGGED rather than swallowed: returning {} in
+    silence made the dashboard show placeholder defaults as if that were the
+    real configuration.
+    """
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Could not read {path}: {e}")
     return default if default is not None else {}
 
 
@@ -286,7 +292,17 @@ def api_status():
 def get_settings():
     # no-store so the dashboard always reflects the live config.json and never a
     # cached copy — otherwise edits made directly on disk wouldn't show up.
-    resp = jsonify(_read_json(BASE_DIR / "config.json"))
+    cfg = _read_json(BASE_DIR / "config.json")
+    if not cfg.get("trading"):
+        # Say so instead of returning {} and letting the form invent defaults.
+        resp = jsonify({
+            "error": f"config.json could not be read from {BASE_DIR}. "
+                     f"It must be valid JSON — the form has NOT been filled in."
+        })
+        resp.status_code = 500
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    resp = jsonify(cfg)
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 

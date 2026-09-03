@@ -98,7 +98,10 @@ class Config:
     def _load_config(self):
         try:
             if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
+                # utf-8-sig, not the Windows locale default: editors and
+                # PowerShell add a UTF-8 BOM, which makes a plain read fail and
+                # used to fall back to defaults without a word.
+                with open(self.config_file, 'r', encoding='utf-8-sig') as f:
                     config_data = json.load(f)
 
                 quotex_data = config_data.get('quotex', {})
@@ -205,7 +208,7 @@ class Config:
                 },
                 'logging': self.logging.__dict__,
             }
-            with open(self.config_file, 'w') as f:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_data, f, indent=2)
             self.logger.info(f"Configuration saved to {self.config_file}")
         except Exception as e:
